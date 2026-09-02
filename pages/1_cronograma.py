@@ -63,7 +63,7 @@ estilo = (matriz.style
           .map(_pintar, subset=colunas_dias)
           .set_properties(subset=colunas_dias, **{"text-align": "center"}))
 
-st.markdown("**Grade do mês** — cada célula traz o status da carga do dia")
+st.markdown("**Grade do mês** — cada célula traz o status da carga na sua data de corte")
 st.dataframe(estilo, width="stretch", hide_index=True,
              height=min(80 + 35 * len(matriz), 600))
 
@@ -86,7 +86,7 @@ with st.expander("Exportar cronograma"):
     if not df_mes.empty:
         st.download_button(
             "Baixar cargas do mês em CSV",
-            df_mes.drop(columns=["peso_t"], errors="ignore").to_csv(index=False, sep=";"),
+            df_mes.drop(columns=["peso_t", "identificacao"], errors="ignore").to_csv(index=False, sep=";"),
             file_name=f"cargas_{modalidade}_{ano}_{mes:02d}.csv",
             mime="text/csv",
         )
