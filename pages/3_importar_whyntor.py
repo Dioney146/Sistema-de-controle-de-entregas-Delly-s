@@ -1,14 +1,14 @@
-"""Importação do export do Wynthor (.xls) para o banco de dados."""
+"""Importação do export do Wynthor — nível de nota fiscal, com data de corte manual."""
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
 
 from src import db, importer, ui
-from src.config import MODALIDADES
+from src.config import MODALIDADES, PRAZO_PADRAO_DIAS
 
 ui.configurar_pagina("Importar Wynthor", "📥")
 
@@ -16,89 +16,144 @@ modalidade = ui.seletor_modalidade()
 ui.rodape_sidebar()
 
 info = MODALIDADES[modalidade]
-ui.cabecalho(f"📥 Importar carregamentos — {info['label']}",
-             "envie o arquivo exportado do Wynthor; as notas são agrupadas por NUMCAR")
+label_placa = info["doc_label"]
+
+ui.cabecalho(f"📥 Importar do Wynthor — {info['label']}",
+             "as notas entram individualmente para o checkout por cliente")
 
 st.markdown(
-    "**Mapeamento aplicado:** `NUMCAR` → Carregamento · `TOTPESO` → Peso (somado "
-    "por carregamento) · `DESTINO` → Destino (UF, município e data). Quando "
-    "existirem, `DTSAIDA`, `VLTOTAL`, `NUMNOTA`, `CODCLI`, `PLACA` e `NMOTORA` "
-    "também são aproveitados."
+    "**Colunas usadas:** `CODCLI`, `CLIENTE`, `NUMNOTA` e `NUMCAR`. "
+    f"`DESTINO` e `PLACA` servem só para montar a carga — que é identificada por "
+    f"**data de corte + município + {label_placa.lower()}**. Uma mesma "
+    f"{label_placa.lower()} pode levar mais de um carregamento na mesma viagem: "
+    "nesse caso os dois caem na mesma carga."
 )
 
 arquivo = st.file_uploader("Arquivo do Wynthor", type=["xls", "xlsx", "csv"])
-
 if arquivo is None:
     st.stop()
 
 try:
     bruto = importer.ler_arquivo(arquivo)
+    notas = importer.preparar_notas(bruto)
 except Exception as erro:
     st.error(f"Não consegui ler o arquivo: {erro}")
     st.stop()
 
 resumo = importer.resumo_arquivo(bruto)
 colunas = st.columns(4)
-colunas[0].metric("Linhas (notas)", resumo["linhas"])
-colunas[1].metric("Carregamentos", resumo["carregamentos"])
-colunas[2].metric("Peso total", f"{resumo['peso_total_kg']:,.3f} kg")
-colunas[3].metric("Valor total", ui.formatar_reais(resumo["valor_total"]))
-st.caption(f"Período do arquivo: {resumo['periodo']}")
-
-with st.expander("Ver as primeiras linhas do arquivo bruto"):
-    st.dataframe(bruto.head(20), width="stretch")
-
-cadastro = db.listar_municipios(modalidade)
-prazos = dict(zip(cadastro["nome"], cadastro["prazo_dias"])) if not cadastro.empty else {}
-
-ano_ref = st.number_input("Ano de referência (usado quando o DESTINO só traz dia/mês)",
-                          min_value=2020, max_value=2100, value=date.today().year)
-
-try:
-    consolidado = importer.consolidar(bruto, modalidade, prazos, int(ano_ref))
-except ValueError as erro:
-    st.error(str(erro))
-    st.stop()
-
-if consolidado.empty:
-    st.warning("Nenhum carregamento encontrado no arquivo.")
-    st.stop()
+colunas[0].metric("Linhas", resumo["linhas"])
+colunas[1].metric("Notas fiscais", resumo["notas"])
+colunas[2].metric("Clientes", resumo["clientes"])
+colunas[3].metric("Carregamentos", resumo["carregamentos"])
+st.caption(f"Data de saída que veio no Wynthor: {resumo['saida_wynthor']} "
+           "— informativa apenas, o corte é o que você escolher abaixo.")
 
 st.divider()
-st.subheader(f"{len(consolidado)} carregamento(s) prontos para importar")
 
-existentes = db.numcars_existentes(modalidade)
-consolidado["já_importado"] = consolidado["numcar"].isin(existentes)
+# ---------------------------------------------------------------------------
+# 1. Data de corte (manual)
+# ---------------------------------------------------------------------------
+st.subheader("1. Data de corte")
+col_data, col_prazo = st.columns(2)
+data_corte = col_data.date_input(
+    "Data de corte desta carga", value=date.today(), format="DD/MM/YYYY",
+    help="É o corte real da operação, não o DTSAIDA do Wynthor.",
+)
+dias_prazo = col_prazo.number_input("Prazo de entrega (dias após o corte)",
+                                    min_value=0, value=PRAZO_PADRAO_DIAS)
 
-previa = consolidado[["numcar", "destino_original", "data_saida", "municipio", "uf",
-                      "pedidos", "clientes", "peso_kg", "valor", "previsao_entrega",
-                      "veiculo", "já_importado"]].rename(columns={
-    "numcar": "Carregamento", "destino_original": "Destino",
-    "data_saida": "Saída", "municipio": "Município", "uf": "UF",
-    "pedidos": "Notas", "clientes": "Clientes", "peso_kg": "Peso (kg)",
-    "valor": "Valor (R$)", "previsao_entrega": "Previsão",
-    "veiculo": "Veículo/Placa", "já_importado": "Já importado",
-})
-st.dataframe(previa, width="stretch", hide_index=True)
+# ---------------------------------------------------------------------------
+# 2. Conferência das cargas
+# ---------------------------------------------------------------------------
+st.subheader("2. Confira as cargas")
+grupos = importer.resumir_grupos(notas)
+st.caption("Corrija o município ou a placa se vieram errados do arquivo. "
+           "Cada linha vira uma carga.")
 
-novos = consolidado[~consolidado["já_importado"]]
-if novos.empty:
-    st.info("Todos os carregamentos deste arquivo já estão no banco.")
-    st.stop()
-
-criar_municipios = st.checkbox(
-    "Cadastrar automaticamente municípios que ainda não existem nesta modalidade",
-    value=True,
+grupos_editados = st.data_editor(
+    grupos.drop(columns=["grupo"]),
+    width="stretch", hide_index=True, num_rows="fixed",
+    disabled=["Carregamentos", "Notas", "Clientes", "Peso (kg)",
+              "Valor (R$)", "Saída no Wynthor"],
+    key="editor_grupos",
 )
 
-if st.button(f"⬆️ Importar {len(novos)} carregamento(s)", type="primary"):
-    registros = novos.drop(columns=["destino_original", "já_importado"]).to_dict("records")
-    resultado = db.inserir_cargas_em_lote(registros)
-    if criar_municipios:
-        for _, linha in novos.iterrows():
-            db.sincronizar_municipio(modalidade, linha["municipio"], linha["uf"])
-    st.success(f"{resultado['inseridos']} carregamento(s) importado(s) com sucesso.")
-    if resultado["ignorados"]:
-        st.warning("Ignorados (NUMCAR já existente): "
-                   + ", ".join(resultado["ignorados"]))
-    st.balloons()
+# remapeia o que o usuário eventualmente corrigiu na tabela
+mapa = {}
+for posicao, chave in enumerate(grupos["grupo"]):
+    linha = grupos_editados.iloc[posicao]
+    mapa[chave] = {
+        "municipio": str(linha["Município"]).strip(),
+        "uf": str(linha["UF"]).strip().upper()[:2] or "AM",
+        "placa": str(linha["Placa"]).strip().upper(),
+    }
+
+sem_municipio = [c for c, v in mapa.items() if not v["municipio"]]
+if sem_municipio:
+    st.error("Preencha o município de todas as linhas antes de importar.")
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# 3. Prévia das notas
+# ---------------------------------------------------------------------------
+with st.expander(f"Ver as {len(notas)} notas que serão importadas"):
+    previa = notas[["numcar", "numnota", "codcli", "cliente", "municipio", "placa"]]
+    st.dataframe(previa.rename(columns={
+        "numcar": "Carregamento", "numnota": "Nota fiscal", "codcli": "Cód. cliente",
+        "cliente": "Cliente", "municipio": "Município", "placa": label_placa,
+    }), width="stretch", hide_index=True)
+
+# ---------------------------------------------------------------------------
+# 4. Importar
+# ---------------------------------------------------------------------------
+st.subheader("3. Importar")
+criar_cadastros = st.checkbox(
+    "Cadastrar automaticamente municípios e placas que ainda não existem", value=True)
+
+if st.button(f"⬆️ Importar {len(notas)} nota(s) em {len(mapa)} carga(s)",
+             type="primary"):
+    total_notas, total_repetidas, criadas, atualizadas = 0, 0, 0, 0
+
+    for chave, dados_grupo in mapa.items():
+        recorte = notas[notas["grupo"] == chave]
+        motorista = next((m for m in recorte["motorista"].dropna().unique() if m), None)
+        peso = float(recorte["peso_kg"].sum())
+        valor = float(recorte["valor"].sum())
+        saidas = recorte["data_saida_origem"].dropna()
+
+        carga_id, foi_criada = db.obter_ou_criar_carga(
+            modalidade, data_corte, dados_grupo["municipio"], dados_grupo["placa"],
+            extras={
+                "uf": dados_grupo["uf"],
+                "motorista": motorista,
+                "previsao_entrega": data_corte + timedelta(days=int(dias_prazo)),
+                "data_saida_origem": saidas.min().date() if not saidas.empty else None,
+                "peso_kg": peso,
+                "valor": valor,
+                "origem_dado": "wynthor",
+            },
+        )
+        criadas += int(foi_criada)
+        atualizadas += int(not foi_criada)
+
+        resultado = db.inserir_notas(carga_id, modalidade, recorte.to_dict("records"))
+        total_notas += resultado["inseridas"]
+        total_repetidas += resultado["repetidas"]
+
+        if not foi_criada:  # soma o peso/valor do novo carregamento na carga existente
+            atual = db.buscar_carga_por_id(carga_id) or {}
+            db.salvar_carga({
+                "peso_kg": float(atual.get("peso_kg") or 0) + peso,
+                "valor": float(atual.get("valor") or 0) + valor,
+            }, carga_id=carga_id)
+
+        if criar_cadastros:
+            db.sincronizar_municipio(modalidade, dados_grupo["municipio"], dados_grupo["uf"])
+            db.sincronizar_veiculo(modalidade, dados_grupo["placa"], motorista)
+
+    st.success(f"{total_notas} nota(s) importada(s) · {criadas} carga(s) nova(s) "
+               f"· {atualizadas} carga(s) já existente(s) recebeu(ram) notas.")
+    if total_repetidas:
+        st.info(f"{total_repetidas} nota(s) já estavam no banco e foram ignoradas.")
+    st.caption("Agora é só ir na página **Checkout** para dar baixa por cliente.")
