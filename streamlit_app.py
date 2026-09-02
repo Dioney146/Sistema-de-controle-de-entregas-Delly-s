@@ -50,10 +50,18 @@ linha1[3].metric("% no prazo (OTIF)", f"{kpi_mes['otif']:.1f}%",
                  help="entregas dentro da previsão")
 
 linha2 = st.columns(4)
-linha2[0].metric("Peso expedido", f"{kpi_mes['peso_t']:.3f} t")
-linha2[1].metric("Valor expedido", ui.formatar_reais(kpi_mes["valor"]))
-linha2[2].metric("Fora do prazo", ui.formatar_numero(kpi_mes["fora_prazo"]))
-linha2[3].metric("Ocorrências", ui.formatar_numero(kpi_mes["ocorrencias"]))
+linha2[0].metric("Notas fiscais", ui.formatar_numero(kpi_mes["notas"]),
+                 help="notas importadas no mês")
+linha2[1].metric("Checkout", f"{kpi_mes['checkout']:.1f}%",
+                 help="notas já conferidas (entregues, devolvidas ou reagendadas)")
+linha2[2].metric("Notas pendentes", ui.formatar_numero(kpi_mes["notas_pendentes"]))
+linha2[3].metric("Notas com ocorrência", ui.formatar_numero(kpi_mes["notas_ocorrencia"]))
+
+linha3 = st.columns(4)
+linha3[0].metric("Peso expedido", f"{kpi_mes['peso_t']:.3f} t")
+linha3[1].metric("Valor expedido", ui.formatar_reais(kpi_mes["valor"]))
+linha3[2].metric("Fora do prazo", ui.formatar_numero(kpi_mes["fora_prazo"]))
+linha3[3].metric("Municípios no mês", ui.formatar_numero(kpi_mes["municipios"]))
 
 st.divider()
 
@@ -61,11 +69,11 @@ st.divider()
 # Acumulado do ano
 # --------------------------------------------------------------------------
 st.subheader(f"Acumulado do ano — {ano}")
-linha3 = st.columns(4)
-linha3[0].metric("Cargas no ano", ui.formatar_numero(kpi_ano["cargas"]))
-linha3[1].metric("Entregues no ano", ui.formatar_numero(kpi_ano["entregues"]))
-linha3[2].metric("% no prazo (ano)", f"{kpi_ano['otif']:.1f}%")
-linha3[3].metric("Municípios atendidos", ui.formatar_numero(kpi_ano["municipios"]))
+linha4 = st.columns(4)
+linha4[0].metric("Cargas no ano", ui.formatar_numero(kpi_ano["cargas"]))
+linha4[1].metric("Entregues no ano", ui.formatar_numero(kpi_ano["entregues"]))
+linha4[2].metric("% no prazo (ano)", f"{kpi_ano['otif']:.1f}%")
+linha4[3].metric("Municípios atendidos", ui.formatar_numero(kpi_ano["municipios"]))
 
 st.divider()
 
@@ -88,12 +96,12 @@ with col_esq:
     fig.update_layout(margin=dict(l=10, r=10, t=20, b=10), legend_title_text="")
     st.plotly_chart(fig, width="stretch")
 
-    st.markdown("**Peso por dia no mês (t)**")
+    st.markdown("**Notas fiscais por dia de corte**")
     serie = metrics.serie_diaria(df_mes, ano, mes)
-    fig2 = px.bar(serie, x="dia", y="Peso (t)", height=260,
+    fig2 = px.bar(serie, x="dia", y="Notas", height=260,
                   color_discrete_sequence=["#E4572E"])
     fig2.update_layout(margin=dict(l=10, r=10, t=20, b=10),
-                       xaxis_title="dia do mês")
+                       xaxis_title="dia de corte")
     st.plotly_chart(fig2, width="stretch")
 
 with col_dir:
@@ -108,14 +116,27 @@ with col_dir:
         st.plotly_chart(fig3, width="stretch")
     st.dataframe(status_mes, width="stretch", hide_index=True)
 
-    st.markdown("**Ocorrências do mês**")
-    ocorrencias = metrics.resumo_por_ocorrencia(df_mes)
+    st.markdown("**Ocorrências do mês (notas)**")
+    notas_mes = db.listar_notas(modalidade)
+    if not notas_mes.empty and not df_mes.empty:
+        notas_mes = notas_mes[notas_mes["carga_id"].isin(df_mes["id"])]
+    ocorrencias = metrics.resumo_por_ocorrencia(notas_mes)
     if ocorrencias.empty:
         st.caption("Nenhuma ocorrência registrada no mês.")
     else:
         st.dataframe(ocorrencias, width="stretch", hide_index=True)
 
 st.divider()
-st.markdown("**Desempenho por município (ano)**")
-st.dataframe(metrics.resumo_por_municipio(df_ano), width="stretch",
-             hide_index=True)
+col_mun, col_cli = st.columns([3, 2])
+with col_cli:
+    st.markdown("**Clientes com notas pendentes (mês)**")
+    ranking = metrics.ranking_clientes(notas_mes)
+    if ranking.empty:
+        st.caption("Nenhuma nota pendente no mês.")
+    else:
+        st.dataframe(ranking, width="stretch", hide_index=True)
+
+with col_mun:
+    st.markdown("**Desempenho por município (ano)**")
+    st.dataframe(metrics.resumo_por_municipio(df_ano), width="stretch",
+                 hide_index=True)
