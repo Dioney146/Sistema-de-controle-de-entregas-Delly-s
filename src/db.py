@@ -2,13 +2,18 @@
 
 Funciona em dois modos, sem mudar o código:
 
-* **Local / GitHub Codespaces** — SQLite em `data/dellys_entregas.db`
-* **Streamlit Cloud** — Postgres (Supabase, Neon, Railway...) via
-  `st.secrets["database"]["url"]`
+* **Local** — SQLite em `data/dellys_entregas.db`
+* **Streamlit Cloud** — Postgres (Supabase) via `st.secrets["database"]["url"]`
 
-O sistema de arquivos do Streamlit Cloud é efêmero: se você publicar o app
-usando SQLite, os dados somem a cada redeploy/reinício. Para produção use
-Postgres e coloque a URL em `.streamlit/secrets.toml`.
+Modelo de dados
+---------------
+A **carga** é identificada por  modalidade + data de corte + município + placa.
+Uma mesma placa pode levar mais de um carregamento (NUMCAR) na mesma viagem;
+todos os NUMCAR da viagem ficam guardados na coluna `numcars`.
+
+Cada carga tem N **notas fiscais** (tabela `notas`), e é nelas que acontece o
+checkout: cada nota recebe status (entregue, devolvida, reagendada...) e
+ocorrência. O status da carga é recalculado a partir das notas.
 """
 
 from __future__ import annotations
@@ -20,15 +25,12 @@ from pathlib import Path
 import pandas as pd
 import sqlalchemy as sa
 from sqlalchemy import (
-    Boolean, Column, Date, DateTime, Float, Integer, MetaData,
+    Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, MetaData,
     String, Table, UniqueConstraint, func,
 )
 
-from src.config import MODALIDADE_PADRAO, PRAZO_PADRAO_DIAS
+from src.config import MODALIDADE_PADRAO, PRAZO_PADRAO_DIAS, STATUS_NOTA_RESOLVIDO
 
-# ---------------------------------------------------------------------------
-# Engine
-# ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -69,9 +71,9 @@ veiculos = Table(
     "veiculos", metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("modalidade", String(20), nullable=False),
-    Column("descricao", String(80), nullable=False),   # veículo ou embarcação
-    Column("identificacao", String(30)),               # placa / registro da balsa
-    Column("motorista", String(80)),                   # motorista ou responsável
+    Column("descricao", String(80), nullable=False),
+    Column("identificacao", String(30)),
+    Column("motorista", String(80)),
     Column("telefone", String(30)),
     Column("transportadora", String(80)),
     Column("ativo", Boolean, default=True),
@@ -79,31 +81,49 @@ veiculos = Table(
                      name="uq_veiculo_modalidade"),
 )
 
+# A chave da carga: modalidade + data de corte + município + placa
 cargas = Table(
     "cargas", metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("modalidade", String(20), nullable=False),
-    Column("numcar", String(30)),                      # carregamento (Wynthor)
-    Column("data_saida", Date, nullable=False),        # data de corte / saída
+    Column("data_corte", Date, nullable=False),
     Column("municipio", String(120), nullable=False),
+    Column("placa", String(30), nullable=False, default=""),
     Column("uf", String(2), default="AM"),
+    Column("numcars", String(200)),        # carregamentos da viagem, separados por vírgula
     Column("praca", String(60)),
     Column("transportadora", String(80)),
     Column("motorista", String(80)),
-    Column("veiculo", String(80)),                     # placa ou embarcação
-    Column("pedidos", Integer, default=0),
-    Column("clientes", Integer, default=0),
-    Column("peso_kg", Float, default=0.0),
-    Column("valor", Float, default=0.0),
+    Column("data_saida_origem", Date),     # DTSAIDA do Wynthor (informativo)
     Column("previsao_entrega", Date),
     Column("data_entrega", Date),
     Column("status", String(1), default="P"),
     Column("ocorrencia", String(60), default="Sem ocorrência"),
     Column("observacao", String(400)),
+    Column("peso_kg", Float, default=0.0),
+    Column("valor", Float, default=0.0),
     Column("distancia_km", Float, default=0.0),
-    Column("origem_dado", String(20), default="manual"),  # manual | wynthor
+    Column("origem_dado", String(20), default="manual"),
     Column("criado_em", DateTime, server_default=func.now()),
-    UniqueConstraint("modalidade", "numcar", name="uq_carga_numcar"),
+    UniqueConstraint("modalidade", "data_corte", "municipio", "placa",
+                     name="uq_carga_chave"),
+)
+
+notas = Table(
+    "notas", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("carga_id", Integer, ForeignKey("cargas.id", ondelete="CASCADE"),
+           nullable=False),
+    Column("modalidade", String(20), nullable=False),
+    Column("numcar", String(30)),
+    Column("numnota", String(30), nullable=False),
+    Column("codcli", String(30)),
+    Column("cliente", String(200)),
+    Column("status", String(1), default="P"),
+    Column("ocorrencia", String(60), default="Sem ocorrência"),
+    Column("data_checkout", Date),
+    Column("observacao", String(300)),
+    UniqueConstraint("carga_id", "numcar", "numnota", name="uq_nota_carga"),
 )
 
 
@@ -121,21 +141,20 @@ def get_database_url() -> str:
 
 def _build_engine() -> sa.Engine:
     url = get_database_url()
-    if url.startswith("postgres://"):  # normaliza URLs antigas do Heroku/Supabase
+    if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
-    kwargs = {"pool_pre_ping": True}
     if url.startswith("sqlite"):
-        kwargs = {"connect_args": {"check_same_thread": False}}
-    return sa.create_engine(url, **kwargs)
+        return sa.create_engine(url, connect_args={"check_same_thread": False})
+    return sa.create_engine(url, pool_pre_ping=True)
 
 
-try:  # cache do engine quando rodando dentro do Streamlit
+try:
     import streamlit as st
 
     @st.cache_resource(show_spinner=False)
     def get_engine() -> sa.Engine:
         return _build_engine()
-except Exception:  # execução fora do Streamlit (scripts, testes)
+except Exception:
     _ENGINE: sa.Engine | None = None
 
     def get_engine() -> sa.Engine:  # type: ignore[misc]
@@ -146,12 +165,23 @@ except Exception:  # execução fora do Streamlit (scripts, testes)
 
 
 def init_db() -> None:
-    """Cria as tabelas se ainda não existirem."""
     metadata.create_all(get_engine())
 
 
 def is_sqlite() -> bool:
     return get_engine().dialect.name == "sqlite"
+
+
+def esquema_desatualizado() -> bool:
+    """True se a tabela `cargas` ainda for a versão antiga (com `numcar`)."""
+    try:
+        inspetor = sa.inspect(get_engine())
+        if "cargas" not in inspetor.get_table_names():
+            return False
+        colunas = {c["name"] for c in inspetor.get_columns("cargas")}
+        return "data_corte" not in colunas
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +199,7 @@ def listar_municipios(modalidade: str | None = None,
         stmt = stmt.where(municipios.c.modalidade == modalidade)
     if somente_ativos:
         stmt = stmt.where(municipios.c.ativo.is_(True))
-    stmt = stmt.order_by(municipios.c.ordem, municipios.c.nome)
-    return _read(stmt)
+    return _read(stmt.order_by(municipios.c.ordem, municipios.c.nome))
 
 
 def listar_transportadoras(modalidade: str | None = None) -> pd.DataFrame:
@@ -189,45 +218,50 @@ def listar_veiculos(modalidade: str | None = None) -> pd.DataFrame:
 
 def listar_cargas(modalidade: str | None = None,
                   ano: int | None = None,
-                  mes: int | None = None) -> pd.DataFrame:
-    """Cargas com colunas derivadas (ano, mês, dia, atraso, no_prazo)."""
+                  mes: int | None = None,
+                  com_checkout: bool = True) -> pd.DataFrame:
     stmt = sa.select(cargas)
     if modalidade:
         stmt = stmt.where(cargas.c.modalidade == modalidade)
-    df = _read(stmt.order_by(cargas.c.data_saida.desc(), cargas.c.id.desc()))
-    if df.empty:
-        return _preparar_colunas(df)
+    df = _read(stmt.order_by(cargas.c.data_corte.desc(), cargas.c.id.desc()))
+    df = _preparar_cargas(df)
 
-    df = _preparar_colunas(df)
-    if ano is not None:
+    if com_checkout and not df.empty:
+        df = df.merge(resumo_checkout_por_carga(modalidade), on="id", how="left")
+        for coluna, padrao in (("notas_total", 0), ("notas_entregues", 0),
+                               ("notas_pendentes", 0), ("notas_ocorrencia", 0),
+                               ("clientes", 0)):
+            df[coluna] = df.get(coluna, padrao)
+            df[coluna] = pd.to_numeric(df[coluna], errors="coerce").fillna(0).astype(int)
+        df["checkout_pct"] = (
+            (df["notas_total"] - df["notas_pendentes"]) / df["notas_total"].replace(0, pd.NA) * 100
+        ).fillna(0).round(1)
+
+    if ano is not None and not df.empty:
         df = df[df["ano"] == ano]
-    if mes is not None:
+    if mes is not None and not df.empty:
         df = df[df["mes"] == mes]
     return df.reset_index(drop=True)
 
 
-def _preparar_colunas(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliza tipos e cria colunas calculadas usadas nos relatórios."""
-    colunas = ["id", "modalidade", "numcar", "data_saida", "municipio", "uf",
-               "praca", "transportadora", "motorista", "veiculo", "pedidos",
-               "clientes", "peso_kg", "valor", "previsao_entrega",
-               "data_entrega", "status", "ocorrencia", "observacao",
+def _preparar_cargas(df: pd.DataFrame) -> pd.DataFrame:
+    colunas = ["id", "modalidade", "data_corte", "municipio", "placa", "uf",
+               "numcars", "praca", "transportadora", "motorista",
+               "data_saida_origem", "previsao_entrega", "data_entrega",
+               "status", "ocorrencia", "observacao", "peso_kg", "valor",
                "distancia_km", "origem_dado"]
     for col in colunas:
         if col not in df.columns:
             df[col] = pd.NA
 
-    for col in ("data_saida", "previsao_entrega", "data_entrega"):
+    for col in ("data_corte", "previsao_entrega", "data_entrega", "data_saida_origem"):
         df[col] = pd.to_datetime(df[col], errors="coerce")
-
     for col in ("peso_kg", "valor", "distancia_km"):
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-    for col in ("pedidos", "clientes"):
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
-    df["ano"] = df["data_saida"].dt.year
-    df["mes"] = df["data_saida"].dt.month
-    df["dia"] = df["data_saida"].dt.day
+    df["ano"] = df["data_corte"].dt.year
+    df["mes"] = df["data_corte"].dt.month
+    df["dia"] = df["data_corte"].dt.day
     df["peso_t"] = df["peso_kg"] / 1000.0
 
     atraso = (df["data_entrega"] - df["previsao_entrega"]).dt.days
@@ -240,11 +274,74 @@ def _preparar_colunas(df: pd.DataFrame) -> pd.DataFrame:
         & (df["ocorrencia"].astype(str).str.strip() != "")
         & (df["ocorrencia"] != "Sem ocorrência")
     )
+    df["identificacao"] = (
+        df["data_corte"].dt.strftime("%d/%m/%Y").fillna("—") + " · "
+        + df["municipio"].astype(str) + " · "
+        + df["placa"].fillna("").astype(str).replace("", "sem placa")
+    )
     return df
 
 
+def listar_notas(modalidade: str | None = None,
+                 carga_id: int | None = None) -> pd.DataFrame:
+    stmt = sa.select(notas)
+    if modalidade:
+        stmt = stmt.where(notas.c.modalidade == modalidade)
+    if carga_id:
+        stmt = stmt.where(notas.c.carga_id == carga_id)
+    df = _read(stmt.order_by(notas.c.cliente, notas.c.numnota))
+    if df.empty:
+        for col in ["id", "carga_id", "modalidade", "numcar", "numnota", "codcli",
+                    "cliente", "status", "ocorrencia", "data_checkout", "observacao"]:
+            if col not in df.columns:
+                df[col] = pd.NA
+        return df
+    df["data_checkout"] = pd.to_datetime(df["data_checkout"], errors="coerce")
+    df["pendente"] = df["status"] == "P"
+    df["entregue"] = df["status"] == "E"
+    df["com_ocorrencia"] = (
+        df["ocorrencia"].notna()
+        & (df["ocorrencia"].astype(str).str.strip() != "")
+        & (df["ocorrencia"] != "Sem ocorrência")
+    )
+    return df
+
+
+def resumo_checkout_por_carga(modalidade: str | None = None) -> pd.DataFrame:
+    """Contagem de notas por carga (total, entregues, pendentes, clientes)."""
+    df = listar_notas(modalidade)
+    if df.empty:
+        return pd.DataFrame(columns=["id", "notas_total", "notas_entregues",
+                                     "notas_pendentes", "notas_ocorrencia", "clientes"])
+    agrupado = df.groupby("carga_id").agg(
+        notas_total=("id", "count"),
+        notas_entregues=("entregue", "sum"),
+        notas_pendentes=("pendente", "sum"),
+        notas_ocorrencia=("com_ocorrencia", "sum"),
+        clientes=("codcli", "nunique"),
+    ).reset_index().rename(columns={"carga_id": "id"})
+    return agrupado
+
+
+def notas_por_cliente(carga_id: int) -> pd.DataFrame:
+    """Uma linha por cliente da carga, com o andamento do checkout."""
+    df = listar_notas(carga_id=carga_id)
+    if df.empty:
+        return pd.DataFrame(columns=["codcli", "cliente", "Notas", "Entregues",
+                                     "Pendentes", "Ocorrências"])
+    agrupado = df.groupby(["codcli", "cliente"], dropna=False).agg(
+        Notas=("id", "count"),
+        Entregues=("entregue", "sum"),
+        Pendentes=("pendente", "sum"),
+        Ocorrências=("com_ocorrencia", "sum"),
+    ).reset_index()
+    for col in ("Entregues", "Pendentes", "Ocorrências"):
+        agrupado[col] = agrupado[col].astype(int)
+    return agrupado.sort_values("cliente")
+
+
 def anos_disponiveis(modalidade: str | None = None) -> list[int]:
-    df = listar_cargas(modalidade)
+    df = listar_cargas(modalidade, com_checkout=False)
     anos = sorted({int(a) for a in df["ano"].dropna().unique()}) if not df.empty else []
     hoje = date.today().year
     if hoje not in anos:
@@ -267,7 +364,6 @@ def _limpar(valores: dict) -> dict:
 
 
 def salvar_carga(dados: dict, carga_id: int | None = None) -> int:
-    """Insere ou atualiza uma carga. Retorna o id."""
     dados = _limpar(dados)
     with get_engine().begin() as conn:
         if carga_id:
@@ -279,34 +375,172 @@ def salvar_carga(dados: dict, carga_id: int | None = None) -> int:
 
 def excluir_carga(carga_id: int) -> None:
     with get_engine().begin() as conn:
+        conn.execute(sa.delete(notas).where(notas.c.carga_id == carga_id))
         conn.execute(sa.delete(cargas).where(cargas.c.id == carga_id))
 
 
-def numcars_existentes(modalidade: str) -> set[str]:
-    stmt = sa.select(cargas.c.numcar).where(cargas.c.modalidade == modalidade)
-    df = _read(stmt)
+def buscar_carga(modalidade: str, data_corte, municipio: str,
+                 placa: str) -> dict | None:
+    """Procura a carga pela chave  modalidade + data de corte + município + placa."""
+    if isinstance(data_corte, pd.Timestamp):
+        data_corte = data_corte.date()
+    stmt = sa.select(cargas).where(
+        (cargas.c.modalidade == modalidade)
+        & (cargas.c.data_corte == data_corte)
+        & (sa.func.upper(cargas.c.municipio) == (municipio or "").upper())
+        & (sa.func.upper(sa.func.coalesce(cargas.c.placa, "")) == (placa or "").upper())
+    )
+    with get_engine().connect() as conn:
+        linha = conn.execute(stmt).mappings().first()
+    return dict(linha) if linha else None
+
+
+def obter_ou_criar_carga(modalidade: str, data_corte, municipio: str,
+                         placa: str, extras: dict | None = None) -> tuple[int, bool]:
+    """Devolve (carga_id, foi_criada) para a chave da carga."""
+    existente = buscar_carga(modalidade, data_corte, municipio, placa)
+    if existente:
+        return int(existente["id"]), False
+    dados = {
+        "modalidade": modalidade,
+        "data_corte": data_corte,
+        "municipio": municipio,
+        "placa": placa or "",
+        "status": "P",
+        "ocorrencia": "Sem ocorrência",
+    }
+    dados.update(extras or {})
+    return salvar_carga(dados), True
+
+
+def numcars_da_carga(carga_id: int) -> list[str]:
+    df = listar_notas(carga_id=carga_id)
+    if df.empty:
+        return []
+    return sorted({str(x) for x in df["numcar"].dropna().unique()})
+
+
+def atualizar_numcars(carga_id: int) -> None:
+    lista = numcars_da_carga(carga_id)
+    salvar_carga({"numcars": ", ".join(lista) if lista else None}, carga_id=carga_id)
+
+
+def notas_existentes(carga_id: int) -> set[tuple[str, str]]:
+    df = listar_notas(carga_id=carga_id)
     if df.empty:
         return set()
-    return {str(x) for x in df["numcar"].dropna().tolist()}
+    return {(str(r["numcar"]), str(r["numnota"])) for _, r in df.iterrows()}
 
 
-def inserir_cargas_em_lote(registros: list[dict]) -> dict:
-    """Insere várias cargas ignorando NUMCAR já existente na modalidade.
-
-    Retorna {"inseridos": n, "ignorados": [numcar, ...]}.
-    """
-    inseridos, ignorados = 0, []
+def inserir_notas(carga_id: int, modalidade: str,
+                  registros: list[dict]) -> dict:
+    """Insere notas da carga, pulando as que já existem (mesmo NUMCAR + nota)."""
+    existentes = notas_existentes(carga_id)
+    novos, repetidas = [], 0
     for reg in registros:
-        existentes = numcars_existentes(reg["modalidade"])
-        numcar = str(reg.get("numcar") or "")
-        if numcar and numcar in existentes:
-            ignorados.append(numcar)
+        chave = (str(reg.get("numcar")), str(reg.get("numnota")))
+        if chave in existentes:
+            repetidas += 1
             continue
-        salvar_carga(reg)
-        inseridos += 1
-    return {"inseridos": inseridos, "ignorados": ignorados}
+        existentes.add(chave)
+        novos.append({
+            "carga_id": carga_id,
+            "modalidade": modalidade,
+            "numcar": str(reg.get("numcar") or ""),
+            "numnota": str(reg.get("numnota") or ""),
+            "codcli": str(reg.get("codcli") or ""),
+            "cliente": str(reg.get("cliente") or ""),
+            "status": "P",
+            "ocorrencia": "Sem ocorrência",
+            "data_checkout": None,
+            "observacao": None,
+        })
+    if novos:
+        with get_engine().begin() as conn:
+            conn.execute(sa.insert(notas), novos)
+        atualizar_numcars(carga_id)
+        recalcular_status_carga(carga_id)
+    return {"inseridas": len(novos), "repetidas": repetidas}
 
 
+def salvar_nota(dados: dict, nota_id: int) -> None:
+    dados = _limpar(dados)
+    with get_engine().begin() as conn:
+        conn.execute(sa.update(notas).where(notas.c.id == nota_id).values(**dados))
+
+
+def checkout_notas(ids: list[int], status: str, ocorrencia: str,
+                   data_checkout, observacao: str | None = None) -> int:
+    """Dá checkout em várias notas de uma vez (um cliente ou a carga inteira)."""
+    if not ids:
+        return 0
+    if isinstance(data_checkout, pd.Timestamp):
+        data_checkout = data_checkout.date()
+    valores = {
+        "status": status,
+        "ocorrencia": ocorrencia or "Sem ocorrência",
+        "data_checkout": data_checkout if status != "P" else None,
+    }
+    if observacao is not None:
+        valores["observacao"] = observacao or None
+    with get_engine().begin() as conn:
+        conn.execute(sa.update(notas).where(notas.c.id.in_(ids)).values(**valores))
+    return len(ids)
+
+
+def recalcular_status_carga(carga_id: int) -> str:
+    """Status da carga a partir das notas: P / T (parcial) / E / D."""
+    df = listar_notas(carga_id=carga_id)
+    if df.empty:
+        return "P"
+    atual = buscar_carga_por_id(carga_id)
+    if atual and atual.get("status") == "C":
+        return "C"
+
+    total = len(df)
+    resolvidas = int(df["status"].isin(STATUS_NOTA_RESOLVIDO).sum())
+    entregues = int((df["status"] == "E").sum())
+    devolvidas = int((df["status"] == "D").sum())
+
+    if resolvidas == 0:
+        novo = "P"
+    elif resolvidas < total:
+        novo = "T"
+    elif entregues == 0 and devolvidas > 0:
+        novo = "D"
+    else:
+        novo = "E"
+
+    valores: dict = {"status": novo}
+    if novo in ("E", "D"):
+        datas = df["data_checkout"].dropna()
+        if not datas.empty:
+            valores["data_entrega"] = datas.max().date()
+    else:
+        valores["data_entrega"] = None
+
+    ocorrencias = df.loc[df["com_ocorrencia"], "ocorrencia"]
+    valores["ocorrencia"] = (ocorrencias.mode().iloc[0]
+                             if not ocorrencias.empty else "Sem ocorrência")
+    salvar_carga(valores, carga_id=carga_id)
+    return novo
+
+
+def buscar_carga_por_id(carga_id: int) -> dict | None:
+    with get_engine().connect() as conn:
+        linha = conn.execute(
+            sa.select(cargas).where(cargas.c.id == carga_id)).mappings().first()
+    return dict(linha) if linha else None
+
+
+def excluir_nota(nota_id: int) -> None:
+    with get_engine().begin() as conn:
+        conn.execute(sa.delete(notas).where(notas.c.id == nota_id))
+
+
+# ---------------------------------------------------------------------------
+# Cadastros
+# ---------------------------------------------------------------------------
 def salvar_municipio(dados: dict, municipio_id: int | None = None) -> int:
     dados = _limpar(dados)
     with get_engine().begin() as conn:
@@ -314,8 +548,7 @@ def salvar_municipio(dados: dict, municipio_id: int | None = None) -> int:
             conn.execute(sa.update(municipios)
                          .where(municipios.c.id == municipio_id).values(**dados))
             return municipio_id
-        result = conn.execute(sa.insert(municipios).values(**dados))
-        return int(result.inserted_primary_key[0])
+        return int(conn.execute(sa.insert(municipios).values(**dados)).inserted_primary_key[0])
 
 
 def excluir_municipio(municipio_id: int) -> None:
@@ -330,14 +563,12 @@ def salvar_transportadora(dados: dict, registro_id: int | None = None) -> int:
             conn.execute(sa.update(transportadoras)
                          .where(transportadoras.c.id == registro_id).values(**dados))
             return registro_id
-        result = conn.execute(sa.insert(transportadoras).values(**dados))
-        return int(result.inserted_primary_key[0])
+        return int(conn.execute(sa.insert(transportadoras).values(**dados)).inserted_primary_key[0])
 
 
 def excluir_transportadora(registro_id: int) -> None:
     with get_engine().begin() as conn:
-        conn.execute(sa.delete(transportadoras)
-                     .where(transportadoras.c.id == registro_id))
+        conn.execute(sa.delete(transportadoras).where(transportadoras.c.id == registro_id))
 
 
 def salvar_veiculo(dados: dict, registro_id: int | None = None) -> int:
@@ -347,8 +578,7 @@ def salvar_veiculo(dados: dict, registro_id: int | None = None) -> int:
             conn.execute(sa.update(veiculos)
                          .where(veiculos.c.id == registro_id).values(**dados))
             return registro_id
-        result = conn.execute(sa.insert(veiculos).values(**dados))
-        return int(result.inserted_primary_key[0])
+        return int(conn.execute(sa.insert(veiculos).values(**dados)).inserted_primary_key[0])
 
 
 def excluir_veiculo(registro_id: int) -> None:
@@ -358,7 +588,6 @@ def excluir_veiculo(registro_id: int) -> None:
 
 def sincronizar_municipio(modalidade: str, nome: str, uf: str = "AM",
                           praca: str | None = None) -> None:
-    """Garante que um município importado exista no cadastro da modalidade."""
     nome = (nome or "").strip()
     if not nome:
         return
@@ -370,14 +599,30 @@ def sincronizar_municipio(modalidade: str, nome: str, uf: str = "AM",
         if conn.execute(stmt).first():
             return
         conn.execute(sa.insert(municipios).values(
-            modalidade=modalidade, nome=nome, uf=uf or "AM",
-            praca=praca, prazo_dias=PRAZO_PADRAO_DIAS,
-            freq_semanal=1, ativo=True, ordem=99,
+            modalidade=modalidade, nome=nome, uf=uf or "AM", praca=praca,
+            prazo_dias=PRAZO_PADRAO_DIAS, freq_semanal=1, ativo=True, ordem=99,
+        ))
+
+
+def sincronizar_veiculo(modalidade: str, placa: str,
+                        motorista: str | None = None) -> None:
+    placa = (placa or "").strip()
+    if not placa:
+        return
+    stmt = sa.select(veiculos.c.id).where(
+        (veiculos.c.modalidade == modalidade)
+        & (sa.func.upper(sa.func.coalesce(veiculos.c.identificacao, "")) == placa.upper())
+    )
+    with get_engine().begin() as conn:
+        if conn.execute(stmt).first():
+            return
+        conn.execute(sa.insert(veiculos).values(
+            modalidade=modalidade, descricao=placa, identificacao=placa,
+            motorista=motorista, ativo=True,
         ))
 
 
 def semear_dados_iniciais() -> None:
-    """Popula os municípios rodoviários da planilha original (só na 1ª vez)."""
     if not listar_municipios(MODALIDADE_PADRAO).empty:
         return
     base = [
