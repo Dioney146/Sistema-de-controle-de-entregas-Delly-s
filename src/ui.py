@@ -35,6 +35,13 @@ def configurar_pagina(titulo: str, icone: str = "🚚") -> None:
     st.set_page_config(page_title=f"{titulo} · Delly's", page_icon=icone,
                        layout="wide", initial_sidebar_state="expanded")
     st.markdown(CSS, unsafe_allow_html=True)
+    if db.esquema_desatualizado():
+        st.error(
+            "O banco ainda está no formato antigo (carga por NUMCAR). "
+            "Rode o SQL de migração descrito no README (DROP TABLE cargas) "
+            "para o app criar a nova estrutura com notas fiscais."
+        )
+        st.stop()
     db.init_db()
     db.semear_dados_iniciais()
 
