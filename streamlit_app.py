@@ -1,6 +1,9 @@
 """Checkout de entregas — tela inicial do sistema.
 
-Lista os clientes da carga escolhida para dar baixa nas notas fiscais.
+Tabela de clientes da carga, no estilo planilha: cada linha é um cliente e o
+que você marcar nela vale para todas as notas fiscais daquele cliente.
+Clientes com mais de uma nota podem ser abertos nota a nota logo abaixo.
+
 Execute com:  streamlit run streamlit_app.py
 """
 
@@ -14,6 +17,10 @@ import streamlit as st
 from src import db, ui
 from src.config import MODALIDADES, OCORRENCIAS, STATUS, STATUS_NOTA
 
+MISTO = "— misto —"
+NOMES_STATUS = list(STATUS_NOTA.values())
+CODIGO_POR_NOME = {v: k for k, v in STATUS_NOTA.items()}
+
 ui.configurar_pagina("Checkout", "✅")
 
 modalidade = ui.seletor_modalidade()
@@ -22,7 +29,7 @@ ui.rodape_sidebar()
 info = MODALIDADES[modalidade]
 label_placa = info["doc_label"]
 ui.cabecalho(f"✅ Checkout de entregas — {info['label']}",
-             "baixa das notas fiscais, cliente por cliente")
+             "uma linha por cliente: marque o status e salve")
 
 cargas = db.listar_cargas(modalidade)
 if cargas.empty:
@@ -31,7 +38,7 @@ if cargas.empty:
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Escolha da carga: data de corte -> município + placa
+# Escolha da carga
 # ---------------------------------------------------------------------------
 datas = sorted(cargas["data_corte"].dropna().dt.date.unique(), reverse=True)
 col_data, col_carga = st.columns([1, 2])
@@ -43,13 +50,13 @@ rotulo = {}
 for identificador, linha in do_dia.iterrows():
     placa = linha["placa"] or f"sem {label_placa.lower()}"
     pendentes = int(linha.get("notas_pendentes", 0) or 0)
-    sufixo = f"— {pendentes} pendente(s)" if pendentes else "— concluída"
-    rotulo[identificador] = f"{linha['municipio']} · {placa} {sufixo}"
+    rotulo[identificador] = (f"{linha['municipio']} · {placa} "
+                             + (f"— {pendentes} pendente(s)" if pendentes else "— concluída"))
 
-carga_id = col_carga.selectbox("Carga", list(rotulo.keys()),
-                               format_func=lambda i: rotulo[i])
+carga_id = int(col_carga.selectbox("Carga", list(rotulo.keys()),
+                                   format_func=lambda i: rotulo[i]))
 carga = do_dia.loc[carga_id]
-notas = db.listar_notas(carga_id=int(carga_id))
+notas = db.listar_notas(carga_id=carga_id)
 
 if notas.empty:
     st.warning("Esta carga não tem notas importadas.")
@@ -59,15 +66,13 @@ if notas.empty:
 # Situação da carga
 # ---------------------------------------------------------------------------
 total = len(notas)
-entregues = int(notas["entregue"].sum())
 pendentes = int(notas["pendente"].sum())
-com_ocorrencia = int(notas["com_ocorrencia"].sum())
 
 topo = st.columns(5)
 topo[0].metric("Notas", total)
-topo[1].metric("Entregues", entregues)
-topo[2].metric("Pendentes", pendentes)
-topo[3].metric("Com ocorrência", com_ocorrencia)
+topo[1].metric("Clientes", int(notas["codcli"].nunique()))
+topo[2].metric("Entregues", int(notas["entregue"].sum()))
+topo[3].metric("Pendentes", pendentes)
 topo[4].metric("Checkout", f"{(total - pendentes) / total * 100:.0f}%")
 
 st.caption(
@@ -77,140 +82,198 @@ st.caption(
 )
 st.progress((total - pendentes) / total)
 
-data_checkout = st.date_input("Data do checkout", value=date.today(),
-                              format="DD/MM/YYYY", key="data_checkout")
+# ---------------------------------------------------------------------------
+# Monta a tabela: uma linha por cliente
+# ---------------------------------------------------------------------------
+linhas = []
+for (codcli, cliente), grupo in notas.groupby(["codcli", "cliente"], dropna=False):
+    status_unicos = grupo["status"].unique()
+    ocorr_unicas = [o for o in grupo["ocorrencia"].fillna("Sem ocorrência").unique()]
+    datas_checkout = grupo["data_checkout"].dropna()
+    observacoes = [o for o in grupo["observacao"].dropna().unique() if str(o).strip()]
+
+    linhas.append({
+        "Cód.": str(codcli),
+        "Cliente": str(cliente),
+        "NFs": int(len(grupo)),
+        "Notas fiscais": ", ".join(sorted(grupo["numnota"].astype(str))),
+        "Status": (STATUS_NOTA.get(status_unicos[0], "Pendente")
+                   if len(status_unicos) == 1 else MISTO),
+        "Ocorrência": (ocorr_unicas[0] if len(ocorr_unicas) == 1 else MISTO),
+        "Data checkout": (datas_checkout.max().date() if not datas_checkout.empty else None),
+        "Observação": observacoes[0] if len(observacoes) == 1 else "",
+    })
+
+tabela = pd.DataFrame(linhas).sort_values("Cliente").reset_index(drop=True)
 
 # ---------------------------------------------------------------------------
-# Ações da carga inteira e correções
+# Filtros e ações rápidas
 # ---------------------------------------------------------------------------
-col_massa, col_ajuste = st.columns(2)
+col_f1, col_f2, col_f3 = st.columns([2, 1, 1])
+busca = col_f1.text_input("Buscar cliente ou código", placeholder="ex.: MERCADINHO ou 815465")
+filtro = col_f2.selectbox("Mostrar", ["Todos", "Só pendentes", "Só com ocorrência"])
+data_checkout = col_f3.date_input("Data do checkout", value=date.today(),
+                                  format="DD/MM/YYYY")
 
-with col_massa.expander("⚡ Aplicar à carga inteira"):
-    status_massa = st.selectbox("Status", list(STATUS_NOTA.keys()),
-                                format_func=lambda k: STATUS_NOTA[k], index=1,
-                                key="status_massa")
-    ocorr_massa = st.selectbox("Ocorrência", OCORRENCIAS, key="ocorr_massa")
-    if st.button("Aplicar a todas as notas", key="btn_massa"):
-        db.checkout_notas(notas["id"].tolist(), status_massa, ocorr_massa,
-                          data_checkout)
-        db.recalcular_status_carga(int(carga_id))
+visivel = tabela.copy()
+if busca.strip():
+    termo = busca.strip().upper()
+    visivel = visivel[visivel["Cliente"].str.upper().str.contains(termo)
+                      | visivel["Cód."].str.contains(termo)]
+if filtro == "Só pendentes":
+    codigos = notas.loc[notas["pendente"], "codcli"].astype(str).unique()
+    visivel = visivel[visivel["Cód."].isin(codigos)]
+elif filtro == "Só com ocorrência":
+    codigos = notas.loc[notas["com_ocorrencia"], "codcli"].astype(str).unique()
+    visivel = visivel[visivel["Cód."].isin(codigos)]
+
+if visivel.empty:
+    st.success("Nenhum cliente nesse filtro.")
+    st.stop()
+
+st.markdown(f"**{len(visivel)} cliente(s)** — edite as colunas Status, Ocorrência "
+            "e Observação e clique em salvar. O que você marcar vale para todas "
+            "as notas do cliente.")
+
+editado = st.data_editor(
+    visivel, width="stretch", hide_index=True, num_rows="fixed",
+    disabled=["Cód.", "Cliente", "NFs", "Notas fiscais"],
+    column_config={
+        "Cód.": st.column_config.TextColumn(width="small"),
+        "Cliente": st.column_config.TextColumn(width="large"),
+        "NFs": st.column_config.NumberColumn(width="small", help="quantidade de notas"),
+        "Notas fiscais": st.column_config.TextColumn(width="medium"),
+        "Status": st.column_config.SelectboxColumn(
+            options=NOMES_STATUS + [MISTO], required=True, width="medium"),
+        "Ocorrência": st.column_config.SelectboxColumn(
+            options=OCORRENCIAS + [MISTO], width="medium"),
+        "Data checkout": st.column_config.DateColumn(format="DD/MM/YYYY", width="small"),
+        "Observação": st.column_config.TextColumn(width="medium"),
+    },
+    key=f"editor_clientes_{carga_id}",
+)
+
+col_salvar, col_todos, col_vazio = st.columns([1, 1, 2])
+
+if col_salvar.button("💾 Salvar checkout", type="primary"):
+    alterados = 0
+    for _, linha in editado.iterrows():
+        original = visivel[visivel["Cód."] == linha["Cód."]].iloc[0]
+        if linha.equals(original):
+            continue
+
+        ids = notas.loc[notas["codcli"].astype(str) == linha["Cód."], "id"].tolist()
+        status_nome = linha["Status"]
+        if status_nome == MISTO:  # não mexeu no status: mantém o de cada nota
+            valores_extras = {}
+            if linha["Ocorrência"] != MISTO:
+                valores_extras["ocorrencia"] = linha["Ocorrência"]
+            if str(linha["Observação"] or "") != str(original["Observação"] or ""):
+                valores_extras["observacao"] = linha["Observação"] or None
+            for nota_id in ids:
+                if valores_extras:
+                    db.salvar_nota(valores_extras, nota_id=int(nota_id))
+            alterados += len(ids) if valores_extras else 0
+            continue
+
+        data_aplicada = linha["Data checkout"] or data_checkout
+        ocorrencia = (linha["Ocorrência"] if linha["Ocorrência"] != MISTO
+                      else "Sem ocorrência")
+        alterados += db.checkout_notas(ids, CODIGO_POR_NOME[status_nome],
+                                       ocorrencia, data_aplicada,
+                                       observacao=linha["Observação"] or None)
+
+    db.recalcular_status_carga(carga_id)
+    if alterados:
+        st.success(f"{alterados} nota(s) atualizada(s).")
+    else:
+        st.info("Nada mudou na tabela.")
+    st.rerun()
+
+if col_todos.button("✅ Marcar visíveis como entregues"):
+    ids = notas.loc[notas["codcli"].astype(str).isin(visivel["Cód."]), "id"].tolist()
+    db.checkout_notas(ids, "E", "Sem ocorrência", data_checkout)
+    db.recalcular_status_carga(carga_id)
+    st.rerun()
+
+# ---------------------------------------------------------------------------
+# Detalhe nota a nota (quando o cliente tem notas em situações diferentes)
+# ---------------------------------------------------------------------------
+st.divider()
+with st.expander("🔍 Ajustar nota a nota (um cliente por vez)"):
+    multiplos = tabela[tabela["NFs"] > 1]
+    escolha = st.selectbox(
+        "Cliente", tabela["Cód."].tolist(),
+        format_func=lambda c: f"{tabela.loc[tabela['Cód.'] == c, 'Cliente'].iloc[0]} "
+                              f"({tabela.loc[tabela['Cód.'] == c, 'NFs'].iloc[0]} NF)",
+    )
+    do_cliente = notas[notas["codcli"].astype(str) == escolha]
+    detalhe = do_cliente[["id", "numcar", "numnota", "status", "ocorrencia",
+                          "data_checkout", "observacao"]].rename(columns={
+        "id": "ID", "numcar": "Carregamento", "numnota": "Nota fiscal",
+        "status": "Status", "ocorrencia": "Ocorrência",
+        "data_checkout": "Data checkout", "observacao": "Observação",
+    })
+    detalhe["Status"] = detalhe["Status"].map(STATUS_NOTA)
+
+    detalhe_editado = st.data_editor(
+        detalhe, width="stretch", hide_index=True, num_rows="fixed",
+        disabled=["ID", "Carregamento", "Nota fiscal"],
+        column_config={
+            "Status": st.column_config.SelectboxColumn(options=NOMES_STATUS,
+                                                       required=True),
+            "Ocorrência": st.column_config.SelectboxColumn(options=OCORRENCIAS),
+            "Data checkout": st.column_config.DateColumn(format="DD/MM/YYYY"),
+        },
+        key=f"editor_notas_{carga_id}_{escolha}",
+    )
+
+    if st.button("💾 Salvar notas deste cliente"):
+        for _, nota in detalhe_editado.iterrows():
+            original = detalhe[detalhe["ID"] == nota["ID"]].iloc[0]
+            if nota.equals(original):
+                continue
+            codigo = CODIGO_POR_NOME[nota["Status"]]
+            data_nota = nota["Data checkout"]
+            if pd.isna(data_nota) and codigo != "P":
+                data_nota = data_checkout
+            db.salvar_nota({
+                "status": codigo,
+                "ocorrencia": nota["Ocorrência"] or "Sem ocorrência",
+                "data_checkout": None if codigo == "P" else data_nota,
+                "observacao": nota["Observação"] or None,
+            }, nota_id=int(nota["ID"]))
+        db.recalcular_status_carga(carga_id)
         st.rerun()
 
-with col_ajuste.expander("🛠️ Corrigir ou excluir esta carga"):
-    st.caption("Use se a importação foi feita com a data de corte, o município "
-               "ou a placa errados.")
-    nova_data = st.date_input("Data de corte", value=data_escolhida,
+# ---------------------------------------------------------------------------
+# Correção da carga e exportação
+# ---------------------------------------------------------------------------
+with st.expander("🛠️ Corrigir ou excluir esta carga"):
+    st.caption("Use se a importação foi feita com data de corte, município ou "
+               f"{label_placa.lower()} errados.")
+    c1, c2, c3 = st.columns(3)
+    nova_data = c1.date_input("Data de corte", value=data_escolhida,
                               format="DD/MM/YYYY", key="corrige_data")
-    novo_municipio = st.text_input("Município", value=carga["municipio"],
+    novo_municipio = c2.text_input("Município", value=carga["municipio"],
                                    key="corrige_mun")
-    nova_placa = st.text_input(label_placa, value=carga["placa"] or "",
+    nova_placa = c3.text_input(label_placa, value=carga["placa"] or "",
                                key="corrige_placa")
-    if st.button("Salvar correção", key="btn_corrige"):
+    if st.button("Salvar correção"):
         db.salvar_carga({"data_corte": nova_data,
                          "municipio": novo_municipio.strip(),
-                         "placa": nova_placa.strip().upper()},
-                        carga_id=int(carga_id))
-        st.success("Carga corrigida.")
+                         "placa": nova_placa.strip().upper()}, carga_id=carga_id)
         st.rerun()
 
     st.divider()
-    if st.checkbox("Confirmo que quero excluir esta carga e todas as suas notas",
-                   key="confirma_exclusao"):
-        if st.button("🗑️ Excluir carga", key="btn_exclui"):
-            db.excluir_carga(int(carga_id))
-            st.success("Carga excluída.")
+    if st.checkbox("Confirmo que quero excluir esta carga e todas as suas notas"):
+        if st.button("🗑️ Excluir carga"):
+            db.excluir_carga(carga_id)
             st.rerun()
 
-st.divider()
-
-# ---------------------------------------------------------------------------
-# Lista de clientes
-# ---------------------------------------------------------------------------
-por_cliente = db.notas_por_cliente(int(carga_id))
-filtro = st.radio("Mostrar", ["Todos", "Só pendentes", "Só com ocorrência"],
-                  horizontal=True)
-
-visiveis = 0
-st.markdown(f"**{len(por_cliente)} cliente(s) nesta carga**")
-
-for _, linha_cliente in por_cliente.iterrows():
-    codcli = linha_cliente["codcli"]
-    do_cliente = notas[notas["codcli"] == codcli]
-
-    if filtro == "Só pendentes" and not do_cliente["pendente"].any():
-        continue
-    if filtro == "Só com ocorrência" and not do_cliente["com_ocorrencia"].any():
-        continue
-    visiveis += 1
-
-    if linha_cliente["Pendentes"] == 0:
-        marca = "🟢" if linha_cliente["Ocorrências"] == 0 else "🟠"
-    elif linha_cliente["Pendentes"] == linha_cliente["Notas"]:
-        marca = "⚪"
-    else:
-        marca = "🔵"
-
-    titulo = (f"{marca} {linha_cliente['cliente']} · cód. {codcli} — "
-              f"{int(linha_cliente['Entregues'])}/{int(linha_cliente['Notas'])} "
-              "nota(s) entregue(s)")
-
-    with st.expander(titulo, expanded=(filtro != "Todos")):
-        col_s, col_o, col_btn = st.columns([1, 2, 1])
-        status_cli = col_s.selectbox("Status", list(STATUS_NOTA.keys()),
-                                     format_func=lambda k: STATUS_NOTA[k],
-                                     index=1, key=f"status_{codcli}")
-        ocorr_cli = col_o.selectbox("Ocorrência", OCORRENCIAS, key=f"ocorr_{codcli}")
-        col_btn.write("")
-        if col_btn.button("Aplicar ao cliente", key=f"btn_{codcli}"):
-            db.checkout_notas(do_cliente["id"].tolist(), status_cli, ocorr_cli,
-                              data_checkout)
-            db.recalcular_status_carga(int(carga_id))
-            st.rerun()
-
-        visao = do_cliente[["id", "numcar", "numnota", "status", "ocorrencia",
-                            "data_checkout", "observacao"]].rename(columns={
-            "id": "ID", "numcar": "Carregamento", "numnota": "Nota fiscal",
-            "status": "Status", "ocorrencia": "Ocorrência",
-            "data_checkout": "Data checkout", "observacao": "Observação",
-        })
-        editado = st.data_editor(
-            visao, width="stretch", hide_index=True, num_rows="fixed",
-            disabled=["ID", "Carregamento", "Nota fiscal"],
-            column_config={
-                "Status": st.column_config.SelectboxColumn(
-                    options=list(STATUS_NOTA.keys()), required=True),
-                "Ocorrência": st.column_config.SelectboxColumn(options=OCORRENCIAS),
-                "Data checkout": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            },
-            key=f"editor_{codcli}",
-        )
-
-        if st.button("💾 Salvar notas deste cliente", key=f"salvar_{codcli}"):
-            for _, nota in editado.iterrows():
-                original = visao[visao["ID"] == nota["ID"]].iloc[0]
-                if nota.equals(original):
-                    continue
-                data_nota = nota["Data checkout"]
-                if pd.isna(data_nota) and nota["Status"] != "P":
-                    data_nota = data_checkout
-                db.salvar_nota({
-                    "status": nota["Status"],
-                    "ocorrencia": nota["Ocorrência"] or "Sem ocorrência",
-                    "data_checkout": None if nota["Status"] == "P" else data_nota,
-                    "observacao": nota["Observação"] or None,
-                }, nota_id=int(nota["ID"]))
-            db.recalcular_status_carga(int(carga_id))
-            st.rerun()
-
-if visiveis == 0:
-    st.success("Nenhum cliente nesse filtro — checkout em dia.")
-
-st.divider()
 st.download_button(
-    "Baixar checkout desta carga (CSV)",
-    notas[["numcar", "numnota", "codcli", "cliente", "status", "ocorrencia",
-           "data_checkout", "observacao"]].to_csv(index=False, sep=";",
-                                                  encoding="utf-8-sig"),
+    "⬇️ Baixar checkout desta carga (CSV para Excel)",
+    tabela.to_csv(index=False, sep=";", encoding="utf-8-sig"),
     file_name=f"checkout_{carga['municipio']}_{data_escolhida:%Y%m%d}.csv",
     mime="text/csv",
 )
