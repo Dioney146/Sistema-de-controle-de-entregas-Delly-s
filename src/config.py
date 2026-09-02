@@ -38,7 +38,7 @@ def modalidade_label(codigo: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Status das cargas (mesmos códigos usados na planilha original)
+# Status da CARGA (mesmos códigos usados na planilha original)
 # ---------------------------------------------------------------------------
 STATUS = {
     "P": "Programado",
@@ -63,13 +63,40 @@ STATUS_POR_NOME = {v: k for k, v in STATUS.items()}
 STATUS_CONCLUIDO = ("E",)
 STATUS_IGNORADO = ("C",)
 
+# ---------------------------------------------------------------------------
+# Status da NOTA FISCAL (checkout por cliente)
+# ---------------------------------------------------------------------------
+STATUS_NOTA = {
+    "P": "Pendente",
+    "E": "Entregue",
+    "R": "Reagendada",
+    "D": "Devolvida",
+    "C": "Cancelada",
+}
+
+STATUS_NOTA_CORES = {
+    "P": "#9AA5B1",
+    "E": "#54A24B",
+    "R": "#F58518",
+    "D": "#E45756",
+    "C": "#6B7280",
+}
+
+# Nota resolvida = já passou pelo checkout (não está mais pendente)
+STATUS_NOTA_RESOLVIDO = ("E", "R", "D", "C")
+
 OCORRENCIAS = [
     "Sem ocorrência",
+    "Cliente fechado",
+    "Cliente ausente",
+    "Recusa de mercadoria",
+    "Avaria de produto",
+    "Falta de mercadoria",
+    "Divergência de pedido",
+    "Problema de pagamento",
+    "Endereço não localizado",
     "Atraso na carga",
     "Atraso no embarque",
-    "Avaria de produto",
-    "Cliente fechado",
-    "Falta de mercadoria",
     "Problema mecânico",
     "Problema de documentação",
     "Nível do rio / navegabilidade",
