@@ -1,142 +1,216 @@
-"""Painel principal — Controle de Entregas Delly's Food Service.
+"""Checkout de entregas — tela inicial do sistema.
 
+Lista os clientes da carga escolhida para dar baixa nas notas fiscais.
 Execute com:  streamlit run streamlit_app.py
 """
 
 from __future__ import annotations
 
-import plotly.express as px
+from datetime import date
+
+import pandas as pd
 import streamlit as st
 
-from src import db, metrics, ui
-from src.config import MESES, MODALIDADES, STATUS, STATUS_CORES
+from src import db, ui
+from src.config import MODALIDADES, OCORRENCIAS, STATUS, STATUS_NOTA
 
-ui.configurar_pagina("Painel", "📊")
+ui.configurar_pagina("Checkout", "✅")
 
 modalidade = ui.seletor_modalidade()
-ano, mes = ui.seletor_periodo(modalidade)
 ui.rodape_sidebar()
 
 info = MODALIDADES[modalidade]
-ui.cabecalho(
-    f"{info['icone']} Painel de Controle — {info['label']}",
-    f"{MESES[mes - 1]} / {ano} · acompanhamento mensal e acumulado do ano",
+label_placa = info["doc_label"]
+ui.cabecalho(f"✅ Checkout de entregas — {info['label']}",
+             "baixa das notas fiscais, cliente por cliente")
+
+cargas = db.listar_cargas(modalidade)
+if cargas.empty:
+    st.info("Nenhuma carga registrada nesta modalidade. Comece pela página "
+            "**Importar Wynthor** para trazer as notas do carregamento.")
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# Escolha da carga: data de corte -> município + placa
+# ---------------------------------------------------------------------------
+datas = sorted(cargas["data_corte"].dropna().dt.date.unique(), reverse=True)
+col_data, col_carga = st.columns([1, 2])
+data_escolhida = col_data.selectbox("Data de corte", datas,
+                                    format_func=lambda d: d.strftime("%d/%m/%Y"))
+
+do_dia = cargas[cargas["data_corte"].dt.date == data_escolhida].set_index("id")
+rotulo = {}
+for identificador, linha in do_dia.iterrows():
+    placa = linha["placa"] or f"sem {label_placa.lower()}"
+    pendentes = int(linha.get("notas_pendentes", 0) or 0)
+    sufixo = f"— {pendentes} pendente(s)" if pendentes else "— concluída"
+    rotulo[identificador] = f"{linha['municipio']} · {placa} {sufixo}"
+
+carga_id = col_carga.selectbox("Carga", list(rotulo.keys()),
+                               format_func=lambda i: rotulo[i])
+carga = do_dia.loc[carga_id]
+notas = db.listar_notas(carga_id=int(carga_id))
+
+if notas.empty:
+    st.warning("Esta carga não tem notas importadas.")
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# Situação da carga
+# ---------------------------------------------------------------------------
+total = len(notas)
+entregues = int(notas["entregue"].sum())
+pendentes = int(notas["pendente"].sum())
+com_ocorrencia = int(notas["com_ocorrencia"].sum())
+
+topo = st.columns(5)
+topo[0].metric("Notas", total)
+topo[1].metric("Entregues", entregues)
+topo[2].metric("Pendentes", pendentes)
+topo[3].metric("Com ocorrência", com_ocorrencia)
+topo[4].metric("Checkout", f"{(total - pendentes) / total * 100:.0f}%")
+
+st.caption(
+    f"Corte {data_escolhida:%d/%m/%Y} · {carga['municipio']}/{carga['uf']} · "
+    f"{label_placa}: {carga['placa'] or '—'} · Carregamento(s): "
+    f"{carga['numcars'] or '—'} · Status: **{STATUS.get(carga['status'], '—')}**"
 )
+st.progress((total - pendentes) / total)
 
-df_ano = db.listar_cargas(modalidade, ano=ano)
-df_mes = df_ano[df_ano["mes"] == mes] if not df_ano.empty else df_ano
+data_checkout = st.date_input("Data do checkout", value=date.today(),
+                              format="DD/MM/YYYY", key="data_checkout")
 
-kpi_mes = metrics.kpis(df_mes)
-kpi_ano = metrics.kpis(df_ano)
+# ---------------------------------------------------------------------------
+# Ações da carga inteira e correções
+# ---------------------------------------------------------------------------
+col_massa, col_ajuste = st.columns(2)
 
-if kpi_ano["cargas"] == 0:
-    st.info(
-        "Ainda não há cargas registradas nesta modalidade. Use **Importar Wynthor** "
-        "para carregar o arquivo do carregamento ou **Entregas** para lançar manualmente."
-    )
+with col_massa.expander("⚡ Aplicar à carga inteira"):
+    status_massa = st.selectbox("Status", list(STATUS_NOTA.keys()),
+                                format_func=lambda k: STATUS_NOTA[k], index=1,
+                                key="status_massa")
+    ocorr_massa = st.selectbox("Ocorrência", OCORRENCIAS, key="ocorr_massa")
+    if st.button("Aplicar a todas as notas", key="btn_massa"):
+        db.checkout_notas(notas["id"].tolist(), status_massa, ocorr_massa,
+                          data_checkout)
+        db.recalcular_status_carga(int(carga_id))
+        st.rerun()
 
-# --------------------------------------------------------------------------
-# KPIs do mês
-# --------------------------------------------------------------------------
-st.subheader(f"Mês — {MESES[mes - 1]}/{ano}")
-linha1 = st.columns(4)
-linha1[0].metric("Cargas programadas", ui.formatar_numero(kpi_mes["cargas"]),
-                 help="viagens planejadas no mês (exclui canceladas)")
-linha1[1].metric("Entregues", ui.formatar_numero(kpi_mes["entregues"]),
-                 help="cargas concluídas")
-linha1[2].metric("% conclusão", f"{kpi_mes['conclusao']:.1f}%",
-                 help="entregues / programadas")
-linha1[3].metric("% no prazo (OTIF)", f"{kpi_mes['otif']:.1f}%",
-                 help="entregas dentro da previsão")
+with col_ajuste.expander("🛠️ Corrigir ou excluir esta carga"):
+    st.caption("Use se a importação foi feita com a data de corte, o município "
+               "ou a placa errados.")
+    nova_data = st.date_input("Data de corte", value=data_escolhida,
+                              format="DD/MM/YYYY", key="corrige_data")
+    novo_municipio = st.text_input("Município", value=carga["municipio"],
+                                   key="corrige_mun")
+    nova_placa = st.text_input(label_placa, value=carga["placa"] or "",
+                               key="corrige_placa")
+    if st.button("Salvar correção", key="btn_corrige"):
+        db.salvar_carga({"data_corte": nova_data,
+                         "municipio": novo_municipio.strip(),
+                         "placa": nova_placa.strip().upper()},
+                        carga_id=int(carga_id))
+        st.success("Carga corrigida.")
+        st.rerun()
 
-linha2 = st.columns(4)
-linha2[0].metric("Notas fiscais", ui.formatar_numero(kpi_mes["notas"]),
-                 help="notas importadas no mês")
-linha2[1].metric("Checkout", f"{kpi_mes['checkout']:.1f}%",
-                 help="notas já conferidas (entregues, devolvidas ou reagendadas)")
-linha2[2].metric("Notas pendentes", ui.formatar_numero(kpi_mes["notas_pendentes"]))
-linha2[3].metric("Notas com ocorrência", ui.formatar_numero(kpi_mes["notas_ocorrencia"]))
-
-linha3 = st.columns(4)
-linha3[0].metric("Peso expedido", f"{kpi_mes['peso_t']:.3f} t")
-linha3[1].metric("Valor expedido", ui.formatar_reais(kpi_mes["valor"]))
-linha3[2].metric("Fora do prazo", ui.formatar_numero(kpi_mes["fora_prazo"]))
-linha3[3].metric("Municípios no mês", ui.formatar_numero(kpi_mes["municipios"]))
-
-st.divider()
-
-# --------------------------------------------------------------------------
-# Acumulado do ano
-# --------------------------------------------------------------------------
-st.subheader(f"Acumulado do ano — {ano}")
-linha4 = st.columns(4)
-linha4[0].metric("Cargas no ano", ui.formatar_numero(kpi_ano["cargas"]))
-linha4[1].metric("Entregues no ano", ui.formatar_numero(kpi_ano["entregues"]))
-linha4[2].metric("% no prazo (ano)", f"{kpi_ano['otif']:.1f}%")
-linha4[3].metric("Municípios atendidos", ui.formatar_numero(kpi_ano["municipios"]))
+    st.divider()
+    if st.checkbox("Confirmo que quero excluir esta carga e todas as suas notas",
+                   key="confirma_exclusao"):
+        if st.button("🗑️ Excluir carga", key="btn_exclui"):
+            db.excluir_carga(int(carga_id))
+            st.success("Carga excluída.")
+            st.rerun()
 
 st.divider()
 
-# --------------------------------------------------------------------------
-# Gráficos e tabelas
-# --------------------------------------------------------------------------
-col_esq, col_dir = st.columns([3, 2])
+# ---------------------------------------------------------------------------
+# Lista de clientes
+# ---------------------------------------------------------------------------
+por_cliente = db.notas_por_cliente(int(carga_id))
+filtro = st.radio("Mostrar", ["Todos", "Só pendentes", "Só com ocorrência"],
+                  horizontal=True)
 
-with col_esq:
-    st.markdown("**Evolução mensal do ano**")
-    resumo = metrics.resumo_mensal_operacao(df_ano)
-    grafico = resumo[resumo["Indicador"].isin(["Cargas programadas", "Cargas entregues"])]
-    dados_longos = grafico.melt(id_vars="Indicador",
-                                value_vars=[c for c in grafico.columns
-                                            if c not in ("Indicador", "Total")],
-                                var_name="Mês", value_name="Cargas")
-    fig = px.bar(dados_longos, x="Mês", y="Cargas", color="Indicador",
-                 barmode="group", height=320,
-                 color_discrete_sequence=["#4C78A8", "#54A24B"])
-    fig.update_layout(margin=dict(l=10, r=10, t=20, b=10), legend_title_text="")
-    st.plotly_chart(fig, width="stretch")
+visiveis = 0
+st.markdown(f"**{len(por_cliente)} cliente(s) nesta carga**")
 
-    st.markdown("**Notas fiscais por dia de corte**")
-    serie = metrics.serie_diaria(df_mes, ano, mes)
-    fig2 = px.bar(serie, x="dia", y="Notas", height=260,
-                  color_discrete_sequence=["#E4572E"])
-    fig2.update_layout(margin=dict(l=10, r=10, t=20, b=10),
-                       xaxis_title="dia de corte")
-    st.plotly_chart(fig2, width="stretch")
+for _, linha_cliente in por_cliente.iterrows():
+    codcli = linha_cliente["codcli"]
+    do_cliente = notas[notas["codcli"] == codcli]
 
-with col_dir:
-    st.markdown("**Status do mês**")
-    status_mes = metrics.resumo_por_status(df_mes)
-    if status_mes["Cargas"].sum() > 0:
-        fig3 = px.pie(status_mes[status_mes["Cargas"] > 0], names="Status",
-                      values="Cargas", hole=0.55, height=260,
-                      color="Status",
-                      color_discrete_map={STATUS[k]: v for k, v in STATUS_CORES.items()})
-        fig3.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig3, width="stretch")
-    st.dataframe(status_mes, width="stretch", hide_index=True)
+    if filtro == "Só pendentes" and not do_cliente["pendente"].any():
+        continue
+    if filtro == "Só com ocorrência" and not do_cliente["com_ocorrencia"].any():
+        continue
+    visiveis += 1
 
-    st.markdown("**Ocorrências do mês (notas)**")
-    notas_mes = db.listar_notas(modalidade)
-    if not notas_mes.empty and not df_mes.empty:
-        notas_mes = notas_mes[notas_mes["carga_id"].isin(df_mes["id"])]
-    ocorrencias = metrics.resumo_por_ocorrencia(notas_mes)
-    if ocorrencias.empty:
-        st.caption("Nenhuma ocorrência registrada no mês.")
+    if linha_cliente["Pendentes"] == 0:
+        marca = "🟢" if linha_cliente["Ocorrências"] == 0 else "🟠"
+    elif linha_cliente["Pendentes"] == linha_cliente["Notas"]:
+        marca = "⚪"
     else:
-        st.dataframe(ocorrencias, width="stretch", hide_index=True)
+        marca = "🔵"
+
+    titulo = (f"{marca} {linha_cliente['cliente']} · cód. {codcli} — "
+              f"{int(linha_cliente['Entregues'])}/{int(linha_cliente['Notas'])} "
+              "nota(s) entregue(s)")
+
+    with st.expander(titulo, expanded=(filtro != "Todos")):
+        col_s, col_o, col_btn = st.columns([1, 2, 1])
+        status_cli = col_s.selectbox("Status", list(STATUS_NOTA.keys()),
+                                     format_func=lambda k: STATUS_NOTA[k],
+                                     index=1, key=f"status_{codcli}")
+        ocorr_cli = col_o.selectbox("Ocorrência", OCORRENCIAS, key=f"ocorr_{codcli}")
+        col_btn.write("")
+        if col_btn.button("Aplicar ao cliente", key=f"btn_{codcli}"):
+            db.checkout_notas(do_cliente["id"].tolist(), status_cli, ocorr_cli,
+                              data_checkout)
+            db.recalcular_status_carga(int(carga_id))
+            st.rerun()
+
+        visao = do_cliente[["id", "numcar", "numnota", "status", "ocorrencia",
+                            "data_checkout", "observacao"]].rename(columns={
+            "id": "ID", "numcar": "Carregamento", "numnota": "Nota fiscal",
+            "status": "Status", "ocorrencia": "Ocorrência",
+            "data_checkout": "Data checkout", "observacao": "Observação",
+        })
+        editado = st.data_editor(
+            visao, width="stretch", hide_index=True, num_rows="fixed",
+            disabled=["ID", "Carregamento", "Nota fiscal"],
+            column_config={
+                "Status": st.column_config.SelectboxColumn(
+                    options=list(STATUS_NOTA.keys()), required=True),
+                "Ocorrência": st.column_config.SelectboxColumn(options=OCORRENCIAS),
+                "Data checkout": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            },
+            key=f"editor_{codcli}",
+        )
+
+        if st.button("💾 Salvar notas deste cliente", key=f"salvar_{codcli}"):
+            for _, nota in editado.iterrows():
+                original = visao[visao["ID"] == nota["ID"]].iloc[0]
+                if nota.equals(original):
+                    continue
+                data_nota = nota["Data checkout"]
+                if pd.isna(data_nota) and nota["Status"] != "P":
+                    data_nota = data_checkout
+                db.salvar_nota({
+                    "status": nota["Status"],
+                    "ocorrencia": nota["Ocorrência"] or "Sem ocorrência",
+                    "data_checkout": None if nota["Status"] == "P" else data_nota,
+                    "observacao": nota["Observação"] or None,
+                }, nota_id=int(nota["ID"]))
+            db.recalcular_status_carga(int(carga_id))
+            st.rerun()
+
+if visiveis == 0:
+    st.success("Nenhum cliente nesse filtro — checkout em dia.")
 
 st.divider()
-col_mun, col_cli = st.columns([3, 2])
-with col_cli:
-    st.markdown("**Clientes com notas pendentes (mês)**")
-    ranking = metrics.ranking_clientes(notas_mes)
-    if ranking.empty:
-        st.caption("Nenhuma nota pendente no mês.")
-    else:
-        st.dataframe(ranking, width="stretch", hide_index=True)
-
-with col_mun:
-    st.markdown("**Desempenho por município (ano)**")
-    st.dataframe(metrics.resumo_por_municipio(df_ano), width="stretch",
-                 hide_index=True)
+st.download_button(
+    "Baixar checkout desta carga (CSV)",
+    notas[["numcar", "numnota", "codcli", "cliente", "status", "ocorrencia",
+           "data_checkout", "observacao"]].to_csv(index=False, sep=";",
+                                                  encoding="utf-8-sig"),
+    file_name=f"checkout_{carga['municipio']}_{data_escolhida:%Y%m%d}.csv",
+    mime="text/csv",
+)
