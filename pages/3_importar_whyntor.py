@@ -55,9 +55,30 @@ st.divider()
 # 1. Data de corte (manual)
 # ---------------------------------------------------------------------------
 st.subheader("1. Data de corte")
+
+abertas = db.listar_programacoes_abertas(modalidade)
+data_sugerida = date.today()
+
+if not abertas.empty:
+    st.markdown("**Cortes programados aguardando arquivo:**")
+    resumo_abertas = abertas[["data_corte", "municipio", "placa"]].rename(
+        columns={"data_corte": "Corte", "municipio": "Município", "placa": label_placa})
+    st.dataframe(resumo_abertas, width="stretch", hide_index=True,
+                 column_config={"Corte": st.column_config.DateColumn(format="DD/MM/YYYY")})
+
+    opcoes = sorted(abertas["data_corte"].dropna().dt.date.unique(), reverse=True)
+    usar_programado = st.checkbox("Usar uma data de corte já programada", value=True)
+    if usar_programado:
+        data_sugerida = st.selectbox(
+            "Corte programado", opcoes, format_func=lambda d: d.strftime("%d/%m/%Y"))
+else:
+    st.caption("Nenhum corte programado em aberto. Você pode programar os cortes "
+               "na página **Programar cortes** assim que eles acontecerem, sem "
+               "esperar o faturamento.")
+
 col_data, col_prazo = st.columns(2)
 data_corte = col_data.date_input(
-    "Data de corte desta carga", value=date.today(), format="DD/MM/YYYY",
+    "Data de corte desta carga", value=data_sugerida, format="DD/MM/YYYY",
     help="É o corte real da operação, não o DTSAIDA do Wynthor.",
 )
 dias_prazo = col_prazo.number_input("Prazo de entrega (dias após o corte)",
@@ -153,7 +174,8 @@ if st.button(f"⬆️ Importar {len(notas)} nota(s) em {len(mapa)} carga(s)",
             db.sincronizar_veiculo(modalidade, dados_grupo["placa"], motorista)
 
     st.success(f"{total_notas} nota(s) importada(s) · {criadas} carga(s) nova(s) "
-               f"· {atualizadas} carga(s) já existente(s) recebeu(ram) notas.")
+               f"· {atualizadas} carga(s) já programada(s)/existente(s) "
+               "recebeu(ram) as notas.")
     if total_repetidas:
         st.info(f"{total_repetidas} nota(s) já estavam no banco e foram ignoradas.")
     st.caption("Agora é só ir na página **Checkout** para dar baixa por cliente.")
