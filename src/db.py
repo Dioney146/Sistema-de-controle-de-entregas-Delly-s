@@ -395,12 +395,53 @@ def buscar_carga(modalidade: str, data_corte, municipio: str,
     return dict(linha) if linha else None
 
 
+def buscar_programacao(modalidade: str, data_corte, municipio: str) -> dict | None:
+    """Carga programada para a data/município cuja placa ainda não foi definida.
+
+    É o caso do corte lançado antes do faturamento: na hora de programar não se
+    sabe a placa, então a importação encaixa as notas nessa carga e preenche a
+    placa que veio do Wynthor.
+    """
+    if isinstance(data_corte, pd.Timestamp):
+        data_corte = data_corte.date()
+    stmt = sa.select(cargas).where(
+        (cargas.c.modalidade == modalidade)
+        & (cargas.c.data_corte == data_corte)
+        & (sa.func.upper(cargas.c.municipio) == (municipio or "").upper())
+        & (sa.func.coalesce(cargas.c.placa, "") == "")
+    )
+    with get_engine().connect() as conn:
+        linha = conn.execute(stmt).mappings().first()
+    return dict(linha) if linha else None
+
+
+def listar_programacoes_abertas(modalidade: str) -> pd.DataFrame:
+    """Cortes já programados que ainda não receberam notas do Wynthor."""
+    df = listar_cargas(modalidade)
+    if df.empty:
+        return df
+    return df[df["notas_total"] == 0].sort_values("data_corte").reset_index(drop=True)
+
+
 def obter_ou_criar_carga(modalidade: str, data_corte, municipio: str,
                          placa: str, extras: dict | None = None) -> tuple[int, bool]:
-    """Devolve (carga_id, foi_criada) para a chave da carga."""
+    """Devolve (carga_id, foi_criada) para a chave da carga.
+
+    Ordem de busca: carga exata (corte + município + placa); se não achar,
+    uma programação do mesmo corte e município ainda sem placa — nesse caso a
+    placa do arquivo é gravada nela.
+    """
     existente = buscar_carga(modalidade, data_corte, municipio, placa)
     if existente:
         return int(existente["id"]), False
+
+    if placa:
+        programada = buscar_programacao(modalidade, data_corte, municipio)
+        if programada:
+            dados = {"placa": placa}
+            dados.update(extras or {})
+            salvar_carga(dados, carga_id=int(programada["id"]))
+            return int(programada["id"]), False
     dados = {
         "modalidade": modalidade,
         "data_corte": data_corte,
