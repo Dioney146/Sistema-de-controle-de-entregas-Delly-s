@@ -134,18 +134,10 @@ if visivel.empty:
     st.success("Nenhum cliente nesse filtro.")
     st.stop()
 
-st.markdown(f"**{len(visivel)} cliente(s)** — marque a caixa dos entregues. "
-            "Para quem teve problema, escolha a ocorrência e deixe a caixa "
-            "desmarcada.")
+st.markdown(f"**{len(visivel)} cliente(s)** — as marcações são feitas no "
+            "navegador e só vão ao servidor quando você grava, no fim.")
 
 visivel = visivel.reset_index(drop=True)
-
-auto = st.toggle(
-    "Gravar a cada clique", value=True,
-    help="Ligado: cada caixa marcada vai direto para o banco (uma ida ao "
-         "servidor por clique). Desligado: marque tudo e grave de uma vez — "
-         "bem mais rápido quando são muitos clientes.",
-)
 
 # A chave do editor carrega uma versão: depois de gravar, ela muda e o widget
 # volta limpo, sem reaplicar a mesma edição no rerun seguinte.
@@ -154,35 +146,49 @@ versao = st.session_state.setdefault(chave_versao, 0)
 chave_editor = f"editor_clientes_{carga_id}_{versao}"
 
 
-def _gravar_edicoes() -> None:
-    """Grava no banco assim que o usuário mexe na tabela."""
+def _coletar_edicoes() -> dict[str, dict]:
+    """Lê o que foi mexido na tabela, sem tocar no banco."""
     estado = st.session_state.get(chave_editor, {})
-    edicoes = estado.get("edited_rows", {})
-    if not edicoes:
-        return
-
-    momento = agora()
-    alterados = 0
-
-    for posicao, campos in edicoes.items():
+    resultado = {}
+    for posicao, campos in estado.get("edited_rows", {}).items():
         linha = visivel.iloc[int(posicao)]
-        marcado = bool(campos.get("✔", linha["✔"]))
         ocorrencia = campos.get("Ocorrência", linha["Ocorrência"])
-        observacao = campos.get("Observação", linha["Observação"])
         if ocorrencia == MISTO:
             ocorrencia = "Sem ocorrência"
+        resultado[linha["Cód."]] = {
+            "marcado": bool(campos.get("✔", linha["✔"])),
+            "ocorrencia": ocorrencia,
+            "observacao": campos.get("Observação", linha["Observação"]),
+        }
+    return resultado
 
-        if marcado:
+
+def _gravar(restante_entregue: bool = False) -> None:
+    """Grava tudo de uma vez: as linhas mexidas e, opcionalmente, o restante."""
+    edicoes = _coletar_edicoes()
+    momento = agora()
+    alterados = 0
+    tratados = set()
+
+    for codigo, dados in edicoes.items():
+        if dados["marcado"]:
             novo_status = "E"                       # entregue
-        elif ocorrencia != "Sem ocorrência":
+        elif dados["ocorrencia"] != "Sem ocorrência":
             novo_status = "D"                       # não entregue, com ocorrência
         else:
             novo_status = "P"                       # segue pendente
 
-        ids = notas.loc[notas["codcli"].astype(str) == linha["Cód."], "id"].tolist()
-        alterados += db.checkout_notas(ids, novo_status, ocorrencia,
-                                       observacao=observacao or None,
+        ids = notas.loc[notas["codcli"].astype(str) == codigo, "id"].tolist()
+        alterados += db.checkout_notas(ids, novo_status, dados["ocorrencia"],
+                                       observacao=dados["observacao"] or None,
                                        momento=momento)
+        tratados.add(codigo)
+
+    if restante_entregue:
+        restantes = [c for c in visivel["Cód."] if c not in tratados]
+        ids = notas.loc[notas["codcli"].astype(str).isin(restantes)
+                        & notas["pendente"], "id"].tolist()
+        alterados += db.checkout_notas(ids, "E", "Sem ocorrência", momento=momento)
 
     if alterados:
         db.recalcular_status_carga(carga_id)
@@ -196,42 +202,50 @@ aviso = st.session_state.pop("ultimo_checkout", None)
 if aviso:
     st.success(aviso)
 
-editado = st.data_editor(
-    visivel, width="stretch", hide_index=True, num_rows="fixed",
-    on_change=_gravar_edicoes if auto else None, key=chave_editor,
-    disabled=["Cód.", "Cliente", "NFs", "Notas fiscais", "Checkout", "Situação"],
-    column_config={
-        "✔": st.column_config.CheckboxColumn(
-            "Entregue", width="small", help="marque quando o cliente receber"),
-        "Cód.": st.column_config.TextColumn(width="small"),
-        "Cliente": st.column_config.TextColumn(width="large"),
-        "NFs": st.column_config.NumberColumn(width="small", help="quantidade de notas"),
-        "Notas fiscais": st.column_config.TextColumn(width="medium"),
-        "Ocorrência": st.column_config.SelectboxColumn(
-            options=OCORRENCIAS + [MISTO], width="medium"),
-        "Checkout": st.column_config.DatetimeColumn(
-            format="DD/MM/YYYY HH:mm", width="medium",
-            help="preenchido automaticamente ao salvar"),
-        "Situação": st.column_config.TextColumn(width="small"),
-        "Observação": st.column_config.TextColumn(width="medium"),
-    },
-)
+# O formulário é o que elimina a espera: dentro dele o Streamlit NÃO recarrega
+# a página a cada caixa marcada. Você marca 40 clientes de graça e só o botão
+# de gravar conversa com o servidor — uma ida, não quarenta.
+with st.form(f"form_checkout_{carga_id}", border=False):
+    st.data_editor(
+        visivel, width="stretch", hide_index=True, num_rows="fixed",
+        key=chave_editor,
+        disabled=["Cód.", "Cliente", "NFs", "Notas fiscais", "Checkout", "Situação"],
+        column_config={
+            "✔": st.column_config.CheckboxColumn(
+                "Entregue", width="small", help="marque quem recebeu"),
+            "Cód.": st.column_config.TextColumn(width="small"),
+            "Cliente": st.column_config.TextColumn(width="large"),
+            "NFs": st.column_config.NumberColumn(width="small",
+                                                 help="quantidade de notas"),
+            "Notas fiscais": st.column_config.TextColumn(width="medium"),
+            "Ocorrência": st.column_config.SelectboxColumn(
+                options=OCORRENCIAS + [MISTO], width="medium"),
+            "Checkout": st.column_config.DatetimeColumn(
+                format="DD/MM/YYYY HH:mm", width="medium",
+                help="preenchido automaticamente ao gravar"),
+            "Situação": st.column_config.TextColumn(width="small"),
+            "Observação": st.column_config.TextColumn(width="medium"),
+        },
+    )
 
-if not auto:
-    if st.button("💾 Gravar todas as marcações", type="primary"):
-        _gravar_edicoes()
-        st.rerun()
-    st.caption("Modo em lote: marque quantos clientes quiser e grave de uma vez.")
+    col_g1, col_g2 = st.columns(2)
+    gravar = col_g1.form_submit_button("💾 Gravar marcações", type="primary",
+                                       width="stretch")
+    gravar_excecao = col_g2.form_submit_button(
+        "⚡ Gravar e dar o restante como entregue", width="stretch",
+        help="Registra só as exceções que você marcou e considera todo o resto "
+             "da lista como entregue — o caminho mais rápido quando a carga "
+             "saiu quase toda certa.")
 
-col_todos, col_limpar, _ = st.columns([1, 1, 2])
-
-if col_todos.button("✅ Marcar visíveis como entregues"):
-    ids = notas.loc[notas["codcli"].astype(str).isin(visivel["Cód."]), "id"].tolist()
-    db.checkout_notas(ids, "E", "Sem ocorrência")
-    db.recalcular_status_carga(carga_id)
-    st.session_state[chave_versao] = versao + 1
+if gravar or gravar_excecao:
+    _gravar(restante_entregue=gravar_excecao)
     st.rerun()
 
+st.caption("Dica: filtre por **Só pendentes**, registre as ocorrências dos "
+           "poucos clientes que deram problema e use o botão da direita — a "
+           "carga inteira fecha numa única gravação.")
+
+col_limpar, _ = st.columns([1, 3])
 if col_limpar.button("↩️ Voltar visíveis para pendente"):
     ids = notas.loc[notas["codcli"].astype(str).isin(visivel["Cód."]), "id"].tolist()
     db.checkout_notas(ids, "P", "Sem ocorrência")
