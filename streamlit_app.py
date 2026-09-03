@@ -19,6 +19,16 @@ MISTO = "— misto —"
 NOMES_STATUS = list(STATUS_NOTA.values())
 CODIGO_POR_NOME = {v: k for k, v in STATUS_NOTA.items()}
 
+# Marcadores da coluna "Situação" — apenas apresentação, o dado gravado
+# continua sendo o código de status ("E", "P", "D"...).
+MARCADOR_STATUS = {
+    "P": "○ Pendente",
+    "E": "● Entregue",
+    "R": "◐ Reagendada",
+    "D": "◆ Devolvida",
+    "C": "× Cancelada",
+}
+
 ui.configurar_pagina("Checkout", "✅")
 
 modalidade = ui.seletor_modalidade()
@@ -26,8 +36,11 @@ ui.rodape_sidebar()
 
 info = MODALIDADES[modalidade]
 label_placa = info["doc_label"]
-ui.cabecalho(f"✅ Checkout de entregas — {info['label']}",
-             "marque o que foi entregue e salve — a data e a hora entram sozinhas")
+ui.cabecalho(
+    f'<span class="marca">◤</span> CENTRO DE CONTROLE DE ENTREGAS',
+    f"{info['icone']} {info['label']}",
+    "Checkout operacional por cliente",
+)
 
 cargas = db.listar_cargas(modalidade, com_checkout=False)
 if cargas.empty:
@@ -35,11 +48,8 @@ if cargas.empty:
             "**Importar Wynthor** para trazer as notas do carregamento.")
     st.stop()
 
-# ---------------------------------------------------------------------------
-# Escolha da carga
-# ---------------------------------------------------------------------------
 datas = sorted(cargas["data_corte"].dropna().dt.date.unique(), reverse=True)
-col_data, col_carga = st.columns([1, 2])
+col_data, col_carga = st.columns([1, 2.4])
 data_escolhida = col_data.selectbox("Data de corte", datas,
                                     format_func=lambda d: d.strftime("%d/%m/%Y"))
 
@@ -47,10 +57,10 @@ do_dia = cargas[cargas["data_corte"].dt.date == data_escolhida].set_index("id")
 rotulo = {}
 for identificador, linha in do_dia.iterrows():
     placa = linha["placa"] or f"sem {label_placa.lower()}"
-    situacao = STATUS.get(linha["status"], "")
-    rotulo[identificador] = f"{linha['municipio']} · {placa} — {situacao}"
+    rotulo[identificador] = (f"{linha['municipio']} · {placa} · "
+                             f"{STATUS.get(linha['status'], '')}")
 
-carga_id = int(col_carga.selectbox("Carga", list(rotulo.keys()),
+carga_id = int(col_carga.selectbox("Carga em operação", list(rotulo.keys()),
                                    format_func=lambda i: rotulo[i]))
 carga = do_dia.loc[carga_id]
 notas = db.listar_notas(carga_id=carga_id)
@@ -64,20 +74,41 @@ if notas.empty:
 # ---------------------------------------------------------------------------
 total = len(notas)
 pendentes = int(notas["pendente"].sum())
+entregues = int(notas["entregue"].sum())
+com_ocorrencia = int(notas["com_ocorrencia"].sum())
+conferidas = total - pendentes
+pct = conferidas / total * 100 if total else 0.0
 
-topo = st.columns(5)
-topo[0].metric("Notas", total)
-topo[1].metric("Clientes", int(notas["codcli"].nunique()))
-topo[2].metric("Entregues", int(notas["entregue"].sum()))
-topo[3].metric("Pendentes", pendentes)
-topo[4].metric("Checkout", f"{(total - pendentes) / total * 100:.0f}%")
+ui.chips([
+    ("📅", "Corte", f"{data_escolhida:%d/%m/%Y}"),
+    ("📍", "Destino", f"{carga['municipio']}/{carga['uf']}"),
+    ("🚛", label_placa, carga["placa"] or "—"),
+    ("📦", "Carregamento", carga["numcars"] or "—"),
+    ("🏁", "Status", STATUS.get(carga["status"], "—")),
+])
 
-st.caption(
-    f"Corte {data_escolhida:%d/%m/%Y} · {carga['municipio']}/{carga['uf']} · "
-    f"{label_placa}: {carga['placa'] or '—'} · Carregamento(s): "
-    f"{carga['numcars'] or '—'} · Status: **{STATUS.get(carga['status'], '—')}**"
-)
-st.progress((total - pendentes) / total)
+ui.kpis([
+    {"icone": "🧾", "rotulo": "Notas fiscais", "valor": total,
+     "detalhe": "no carregamento"},
+    {"icone": "🏢", "rotulo": "Clientes", "valor": int(notas["codcli"].nunique()),
+     "detalhe": "pontos de entrega"},
+    {"icone": "✅", "rotulo": "Entregues", "valor": entregues,
+     "tom": "bom" if entregues else None,
+     "detalhe": f"{entregues / total * 100:.0f}% do total" if total else ""},
+    {"icone": "⏳", "rotulo": "Pendentes", "valor": pendentes,
+     "tom": "atencao" if pendentes else "bom",
+     "detalhe": "aguardando baixa" if pendentes else "nada em aberto"},
+    {"icone": "⚠️", "rotulo": "Ocorrências", "valor": com_ocorrencia,
+     "tom": "atencao" if com_ocorrencia else None,
+     "detalhe": "notas com problema"},
+    {"icone": "📊", "rotulo": "Checkout", "valor": f"{pct:.0f}", "unidade": "%",
+     "tom": "bom" if pct >= 100 else "destaque",
+     "detalhe": f"{conferidas} de {total} conferidas"},
+])
+
+ui.progresso(conferidas, total,
+             f"{conferidas} de {total} notas conferidas",
+             "carga fechada" if pendentes == 0 else f"{pendentes} em aberto")
 
 # ---------------------------------------------------------------------------
 # Uma linha por cliente
@@ -97,8 +128,8 @@ for (codcli, cliente), grupo in notas.groupby(["codcli", "cliente"], dropna=Fals
         "Notas fiscais": ", ".join(sorted(grupo["numnota"].astype(str))),
         "Ocorrência": ocorr_unicas[0] if len(ocorr_unicas) == 1 else MISTO,
         "Checkout": momentos.max() if not momentos.empty else pd.NaT,
-        "Situação": (STATUS_NOTA.get(status_unicos[0], "Pendente")
-                     if len(status_unicos) == 1 else MISTO),
+        "Situação": (MARCADOR_STATUS.get(status_unicos[0], "○ Pendente")
+                     if len(status_unicos) == 1 else "◈ Parcial"),
         "Observação": observacoes[0] if len(observacoes) == 1 else "",
     })
 
@@ -107,11 +138,12 @@ tabela = pd.DataFrame(linhas).sort_values("Cliente").reset_index(drop=True)
 # ---------------------------------------------------------------------------
 # Busca e filtro
 # ---------------------------------------------------------------------------
+ui.secao("Área de trabalho", "conferência nota a nota, agrupada por cliente")
+
 col_f1, col_f2 = st.columns([3, 1])
 busca = col_f1.text_input(
-    "Buscar por nota fiscal, cliente ou código",
-    placeholder="ex.: 450055, MERCADINHO ou 815465")
-filtro = col_f2.selectbox("Mostrar", ["Todos", "Só pendentes", "Só com ocorrência"])
+    "Buscar", placeholder="🔍  nota fiscal, cliente ou código — ex.: 450055")
+filtro = col_f2.selectbox("Filtro", ["Todos", "Só pendentes", "Só com ocorrência"])
 
 visivel = tabela.copy()
 if busca.strip():
@@ -134,8 +166,8 @@ if visivel.empty:
     st.success("Nenhum cliente nesse filtro.")
     st.stop()
 
-st.markdown(f"**{len(visivel)} cliente(s)** — as marcações são feitas no "
-            "navegador e só vão ao servidor quando você grava, no fim.")
+ui.secao(f"{len(visivel)} clientes em conferência",
+         "as marcações ficam no navegador e só vão ao servidor ao gravar")
 
 visivel = visivel.reset_index(drop=True)
 
@@ -208,23 +240,27 @@ if aviso:
 with st.form(f"form_checkout_{carga_id}", border=False):
     st.data_editor(
         visivel, width="stretch", hide_index=True, num_rows="fixed",
+        # altura acompanha a quantidade de clientes, com teto para não empurrar
+        # os botões para fora da tela
+        height=min(120 + 35 * len(visivel), 620),
         key=chave_editor,
         disabled=["Cód.", "Cliente", "NFs", "Notas fiscais", "Checkout", "Situação"],
         column_config={
             "✔": st.column_config.CheckboxColumn(
-                "Entregue", width="small", help="marque quem recebeu"),
-            "Cód.": st.column_config.TextColumn(width="small"),
-            "Cliente": st.column_config.TextColumn(width="large"),
-            "NFs": st.column_config.NumberColumn(width="small",
-                                                 help="quantidade de notas"),
-            "Notas fiscais": st.column_config.TextColumn(width="medium"),
+                "✓", width="small", help="marque quem recebeu"),
+            "Cód.": st.column_config.TextColumn("CÓD.", width="small"),
+            "Cliente": st.column_config.TextColumn("CLIENTE", width="large"),
+            "NFs": st.column_config.NumberColumn(
+                "NF", width="small", help="quantidade de notas do cliente"),
+            "Notas fiscais": st.column_config.TextColumn(
+                "NOTAS FISCAIS", width="medium"),
             "Ocorrência": st.column_config.SelectboxColumn(
-                options=OCORRENCIAS + [MISTO], width="medium"),
+                "OCORRÊNCIA", options=OCORRENCIAS + [MISTO], width="medium"),
             "Checkout": st.column_config.DatetimeColumn(
-                format="DD/MM/YYYY HH:mm", width="medium",
-                help="preenchido automaticamente ao gravar"),
-            "Situação": st.column_config.TextColumn(width="small"),
-            "Observação": st.column_config.TextColumn(width="medium"),
+                "CHECKOUT", format="DD/MM  HH:mm", width="small",
+                help="data e hora gravadas automaticamente"),
+            "Situação": st.column_config.TextColumn("SITUAÇÃO", width="small"),
+            "Observação": st.column_config.TextColumn("OBSERVAÇÃO", width="medium"),
         },
     )
 
@@ -241,9 +277,9 @@ if gravar or gravar_excecao:
     _gravar(restante_entregue=gravar_excecao)
     st.rerun()
 
-st.caption("Dica: filtre por **Só pendentes**, registre as ocorrências dos "
-           "poucos clientes que deram problema e use o botão da direita — a "
-           "carga inteira fecha numa única gravação.")
+st.caption("Fluxo rápido: filtre **Só pendentes**, registre as ocorrências dos "
+           "clientes que deram problema e use o botão da direita — a carga "
+           "inteira fecha numa única gravação.")
 
 col_limpar, _ = st.columns([1, 3])
 if col_limpar.button("↩️ Voltar visíveis para pendente"):
