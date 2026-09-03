@@ -29,7 +29,7 @@ label_placa = info["doc_label"]
 ui.cabecalho(f"✅ Checkout de entregas — {info['label']}",
              "marque o que foi entregue e salve — a data e a hora entram sozinhas")
 
-cargas = db.listar_cargas(modalidade)
+cargas = db.listar_cargas(modalidade, com_checkout=False)
 if cargas.empty:
     st.info("Nenhuma carga registrada nesta modalidade. Comece pela página "
             "**Importar Wynthor** para trazer as notas do carregamento.")
@@ -47,9 +47,8 @@ do_dia = cargas[cargas["data_corte"].dt.date == data_escolhida].set_index("id")
 rotulo = {}
 for identificador, linha in do_dia.iterrows():
     placa = linha["placa"] or f"sem {label_placa.lower()}"
-    pendentes = int(linha.get("notas_pendentes", 0) or 0)
-    rotulo[identificador] = (f"{linha['municipio']} · {placa} "
-                             + (f"— {pendentes} pendente(s)" if pendentes else "— concluída"))
+    situacao = STATUS.get(linha["status"], "")
+    rotulo[identificador] = f"{linha['municipio']} · {placa} — {situacao}"
 
 carga_id = int(col_carga.selectbox("Carga", list(rotulo.keys()),
                                    format_func=lambda i: rotulo[i]))
@@ -135,11 +134,18 @@ if visivel.empty:
     st.success("Nenhum cliente nesse filtro.")
     st.stop()
 
-st.markdown(f"**{len(visivel)} cliente(s)** — marque a caixa e a baixa é "
-            "gravada na hora. Para quem teve problema, escolha a ocorrência e "
-            "deixe a caixa desmarcada.")
+st.markdown(f"**{len(visivel)} cliente(s)** — marque a caixa dos entregues. "
+            "Para quem teve problema, escolha a ocorrência e deixe a caixa "
+            "desmarcada.")
 
 visivel = visivel.reset_index(drop=True)
+
+auto = st.toggle(
+    "Gravar a cada clique", value=True,
+    help="Ligado: cada caixa marcada vai direto para o banco (uma ida ao "
+         "servidor por clique). Desligado: marque tudo e grave de uma vez — "
+         "bem mais rápido quando são muitos clientes.",
+)
 
 # A chave do editor carrega uma versão: depois de gravar, ela muda e o widget
 # volta limpo, sem reaplicar a mesma edição no rerun seguinte.
@@ -192,7 +198,7 @@ if aviso:
 
 editado = st.data_editor(
     visivel, width="stretch", hide_index=True, num_rows="fixed",
-    on_change=_gravar_edicoes, key=chave_editor,
+    on_change=_gravar_edicoes if auto else None, key=chave_editor,
     disabled=["Cód.", "Cliente", "NFs", "Notas fiscais", "Checkout", "Situação"],
     column_config={
         "✔": st.column_config.CheckboxColumn(
@@ -210,6 +216,12 @@ editado = st.data_editor(
         "Observação": st.column_config.TextColumn(width="medium"),
     },
 )
+
+if not auto:
+    if st.button("💾 Gravar todas as marcações", type="primary"):
+        _gravar_edicoes()
+        st.rerun()
+    st.caption("Modo em lote: marque quantos clientes quiser e grave de uma vez.")
 
 col_todos, col_limpar, _ = st.columns([1, 1, 2])
 
