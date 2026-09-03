@@ -129,6 +129,13 @@ notas = Table(
 )
 
 
+# Índices que sustentam as consultas do dia a dia quando a base cresce.
+sa.Index("ix_notas_carga", notas.c.carga_id)
+sa.Index("ix_notas_modalidade_status", notas.c.modalidade, notas.c.status)
+sa.Index("ix_notas_numnota", notas.c.numnota)
+sa.Index("ix_cargas_periodo", cargas.c.modalidade, cargas.c.data_corte)
+
+
 def get_database_url() -> str:
     """URL do banco: secrets do Streamlit > variável de ambiente > SQLite."""
     try:
@@ -171,6 +178,22 @@ except Exception:
 def init_db() -> None:
     metadata.create_all(get_engine())
     _garantir_colunas()
+    _garantir_indices()
+
+
+def _garantir_indices() -> None:
+    """Cria os índices que faltam em tabelas que já existiam.
+
+    `create_all` cria índices junto com a tabela, mas não os adiciona a uma
+    tabela criada por uma versão anterior do sistema.
+    """
+    engine = get_engine()
+    for tabela in metadata.tables.values():
+        for indice in tabela.indexes:
+            try:
+                indice.create(bind=engine, checkfirst=True)
+            except Exception:
+                pass  # índice já existe com outro nome, ou sem permissão
 
 
 def _preparar_banco() -> bool:
@@ -300,11 +323,24 @@ def listar_cargas(modalidade: str | None = None,
     stmt = sa.select(cargas)
     if modalidade:
         stmt = stmt.where(cargas.c.modalidade == modalidade)
+
+    # o recorte de período vai para o SQL: sem isso o app carregaria todas as
+    # cargas de todos os anos só para descartá-las depois no pandas
+    if ano is not None:
+        if mes is not None:
+            inicio = date(ano, mes, 1)
+            fim = date(ano + (mes == 12), (mes % 12) + 1, 1)
+        else:
+            inicio, fim = date(ano, 1, 1), date(ano + 1, 1, 1)
+        stmt = stmt.where(cargas.c.data_corte >= inicio, cargas.c.data_corte < fim)
+
     df = _read(stmt.order_by(cargas.c.data_corte.desc(), cargas.c.id.desc()))
     df = _preparar_cargas(df)
 
     if com_checkout and not df.empty:
-        df = df.merge(resumo_checkout_por_carga(modalidade), on="id", how="left")
+        ids = df["id"].tolist()
+        df = df.merge(resumo_checkout_por_carga(modalidade, carga_ids=ids),
+                      on="id", how="left")
         for coluna, padrao in (("notas_total", 0), ("notas_entregues", 0),
                                ("notas_pendentes", 0), ("notas_ocorrencia", 0),
                                ("clientes", 0)):
@@ -314,10 +350,6 @@ def listar_cargas(modalidade: str | None = None,
             (df["notas_total"] - df["notas_pendentes"]) / df["notas_total"].replace(0, pd.NA) * 100
         ).fillna(0).round(1)
 
-    if ano is not None and not df.empty:
-        df = df[df["ano"] == ano]
-    if mes is not None and not df.empty:
-        df = df[df["mes"] == mes]
     return df.reset_index(drop=True)
 
 
@@ -360,12 +392,23 @@ def _preparar_cargas(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def listar_notas(modalidade: str | None = None,
-                 carga_id: int | None = None) -> pd.DataFrame:
+                 carga_id: int | None = None,
+                 carga_ids: list[int] | None = None) -> pd.DataFrame:
+    """Notas de uma carga, de um conjunto de cargas, ou da modalidade inteira.
+
+    Prefira sempre `carga_id`/`carga_ids`: carregar a modalidade inteira fica
+    pesado assim que a base passa de algumas dezenas de milhares de notas.
+    """
     stmt = sa.select(notas)
     if modalidade:
         stmt = stmt.where(notas.c.modalidade == modalidade)
     if carga_id:
         stmt = stmt.where(notas.c.carga_id == carga_id)
+    if carga_ids is not None:
+        if not carga_ids:
+            stmt = stmt.where(sa.false())
+        else:
+            stmt = stmt.where(notas.c.carga_id.in_(carga_ids))
     df = _read(stmt.order_by(notas.c.cliente, notas.c.numnota))
     if df.empty:
         for col in ["id", "carga_id", "modalidade", "numcar", "numnota", "codcli",
@@ -388,7 +431,8 @@ def listar_notas(modalidade: str | None = None,
     return df
 
 
-def resumo_checkout_por_carga(modalidade: str | None = None) -> pd.DataFrame:
+def resumo_checkout_por_carga(modalidade: str | None = None,
+                              carga_ids: list[int] | None = None) -> pd.DataFrame:
     """Contagem de notas por carga (total, entregues, pendentes, clientes).
 
     A soma é feita pelo banco (GROUP BY), não trazendo as notas para o Python —
@@ -411,6 +455,12 @@ def resumo_checkout_por_carga(modalidade: str | None = None) -> pd.DataFrame:
 
     if modalidade:
         stmt = stmt.where(notas.c.modalidade == modalidade)
+    if carga_ids is not None:
+        if not carga_ids:
+            return pd.DataFrame(columns=["id", "notas_total", "notas_entregues",
+                                         "notas_pendentes", "notas_ocorrencia",
+                                         "clientes"])
+        stmt = stmt.where(notas.c.carga_id.in_(carga_ids))
 
     df = _read(stmt)
     if df.empty:
