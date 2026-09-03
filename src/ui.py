@@ -87,6 +87,20 @@ def rodape_sidebar() -> None:
     destino = "SQLite (local)" if db.is_sqlite() else "Postgres"
     st.sidebar.caption(f"{APP_NAME}\n\nBanco: **{destino}**")
 
+    with st.sidebar.expander("⏱️ Velocidade do banco"):
+        st.caption("Mede o tempo de ida e volta até o banco. Cada clique do "
+                   "checkout custa cerca de 4 dessas viagens.")
+        if st.button("Medir agora", key="btn_latencia"):
+            medida = db.medir_latencia()
+            st.session_state["latencia"] = medida
+        medida = st.session_state.get("latencia")
+        if medida:
+            st.metric("Por consulta", f"{medida['mediana_ms']:.0f} ms")
+            st.caption(
+                f"média {medida['media_ms']:.0f} ms · pior {medida['pior_ms']:.0f} ms\n\n"
+                f"≈ **{medida['por_clique_ms']:.0f} ms** por clique só de rede"
+            )
+
 
 def formatar_reais(valor: float) -> str:
     return (f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
