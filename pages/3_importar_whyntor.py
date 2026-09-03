@@ -130,7 +130,8 @@ with st.expander(f"Ver as {len(notas)} notas que serão importadas"):
 # ---------------------------------------------------------------------------
 st.subheader("3. Importar")
 criar_cadastros = st.checkbox(
-    "Cadastrar automaticamente municípios e placas que ainda não existem", value=True)
+    "Cadastrar automaticamente municípios e placas que ainda não existem", value=True,
+    help="Deixe ligado para não precisar inserir cada município por SQL.")
 
 if st.button(f"⬆️ Importar {len(notas)} nota(s) em {len(mapa)} carga(s)",
              type="primary"):
