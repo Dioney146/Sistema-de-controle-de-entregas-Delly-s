@@ -135,12 +135,64 @@ if visivel.empty:
     st.success("Nenhum cliente nesse filtro.")
     st.stop()
 
-st.markdown(f"**{len(visivel)} cliente(s)** — marque a caixa dos entregues e "
-            "clique em salvar. Para quem teve problema, escolha a ocorrência e "
+st.markdown(f"**{len(visivel)} cliente(s)** — marque a caixa e a baixa é "
+            "gravada na hora. Para quem teve problema, escolha a ocorrência e "
             "deixe a caixa desmarcada.")
+
+visivel = visivel.reset_index(drop=True)
+
+# A chave do editor carrega uma versão: depois de gravar, ela muda e o widget
+# volta limpo, sem reaplicar a mesma edição no rerun seguinte.
+chave_versao = f"versao_editor_{carga_id}"
+versao = st.session_state.setdefault(chave_versao, 0)
+chave_editor = f"editor_clientes_{carga_id}_{versao}"
+
+
+def _gravar_edicoes() -> None:
+    """Grava no banco assim que o usuário mexe na tabela."""
+    estado = st.session_state.get(chave_editor, {})
+    edicoes = estado.get("edited_rows", {})
+    if not edicoes:
+        return
+
+    momento = agora()
+    alterados = 0
+
+    for posicao, campos in edicoes.items():
+        linha = visivel.iloc[int(posicao)]
+        marcado = bool(campos.get("✔", linha["✔"]))
+        ocorrencia = campos.get("Ocorrência", linha["Ocorrência"])
+        observacao = campos.get("Observação", linha["Observação"])
+        if ocorrencia == MISTO:
+            ocorrencia = "Sem ocorrência"
+
+        if marcado:
+            novo_status = "E"                       # entregue
+        elif ocorrencia != "Sem ocorrência":
+            novo_status = "D"                       # não entregue, com ocorrência
+        else:
+            novo_status = "P"                       # segue pendente
+
+        ids = notas.loc[notas["codcli"].astype(str) == linha["Cód."], "id"].tolist()
+        alterados += db.checkout_notas(ids, novo_status, ocorrencia,
+                                       observacao=observacao or None,
+                                       momento=momento)
+
+    if alterados:
+        db.recalcular_status_carga(carga_id)
+        st.session_state[chave_versao] = versao + 1
+        st.session_state["ultimo_checkout"] = (
+            f"{alterados} nota(s) gravada(s) às {momento:%H:%M} de "
+            f"{momento:%d/%m/%Y}.")
+
+
+aviso = st.session_state.pop("ultimo_checkout", None)
+if aviso:
+    st.success(aviso)
 
 editado = st.data_editor(
     visivel, width="stretch", hide_index=True, num_rows="fixed",
+    on_change=_gravar_edicoes, key=chave_editor,
     disabled=["Cód.", "Cliente", "NFs", "Notas fiscais", "Checkout", "Situação"],
     column_config={
         "✔": st.column_config.CheckboxColumn(
@@ -157,50 +209,22 @@ editado = st.data_editor(
         "Situação": st.column_config.TextColumn(width="small"),
         "Observação": st.column_config.TextColumn(width="medium"),
     },
-    key=f"editor_clientes_{carga_id}",
 )
 
-col_salvar, col_todos, _ = st.columns([1, 1, 2])
-
-if col_salvar.button("💾 Salvar checkout", type="primary"):
-    momento = agora()
-    alterados = 0
-
-    for _, linha in editado.iterrows():
-        original = visivel[visivel["Cód."] == linha["Cód."]].iloc[0]
-        mudou_marca = bool(linha["✔"]) != bool(original["✔"])
-        mudou_ocorrencia = linha["Ocorrência"] != original["Ocorrência"]
-        mudou_obs = str(linha["Observação"] or "") != str(original["Observação"] or "")
-        if not (mudou_marca or mudou_ocorrencia or mudou_obs):
-            continue
-
-        ids = notas.loc[notas["codcli"].astype(str) == linha["Cód."], "id"].tolist()
-        ocorrencia = (linha["Ocorrência"] if linha["Ocorrência"] != MISTO
-                      else "Sem ocorrência")
-
-        if linha["✔"]:
-            novo_status = "E"                       # entregue
-        elif ocorrencia != "Sem ocorrência":
-            novo_status = "D"                       # não entregue, com ocorrência
-        else:
-            novo_status = "P"                       # segue pendente
-
-        alterados += db.checkout_notas(
-            ids, novo_status, ocorrencia,
-            observacao=linha["Observação"] or None, momento=momento)
-
-    db.recalcular_status_carga(carga_id)
-    if alterados:
-        st.success(f"{alterados} nota(s) registrada(s) em "
-                   f"{momento:%d/%m/%Y às %H:%M}.")
-    else:
-        st.info("Nada mudou na tabela.")
-    st.rerun()
+col_todos, col_limpar, _ = st.columns([1, 1, 2])
 
 if col_todos.button("✅ Marcar visíveis como entregues"):
     ids = notas.loc[notas["codcli"].astype(str).isin(visivel["Cód."]), "id"].tolist()
     db.checkout_notas(ids, "E", "Sem ocorrência")
     db.recalcular_status_carga(carga_id)
+    st.session_state[chave_versao] = versao + 1
+    st.rerun()
+
+if col_limpar.button("↩️ Voltar visíveis para pendente"):
+    ids = notas.loc[notas["codcli"].astype(str).isin(visivel["Cód."]), "id"].tolist()
+    db.checkout_notas(ids, "P", "Sem ocorrência")
+    db.recalcular_status_carga(carga_id)
+    st.session_state[chave_versao] = versao + 1
     st.rerun()
 
 # ---------------------------------------------------------------------------
