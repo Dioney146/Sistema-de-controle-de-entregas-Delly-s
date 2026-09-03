@@ -173,6 +173,32 @@ def init_db() -> None:
     _garantir_colunas()
 
 
+def _preparar_banco() -> bool:
+    """Verifica esquema, cria tabelas e semeia dados. Devolve True se o esquema
+    ainda é o antigo. Chamado uma única vez por processo (ver `preparar`)."""
+    if esquema_desatualizado():
+        return True
+    init_db()
+    semear_dados_iniciais()
+    return False
+
+
+try:
+    import streamlit as _st
+
+    @_st.cache_resource(show_spinner=False)
+    def preparar() -> bool:
+        return _preparar_banco()
+except Exception:
+    _PREPARADO: bool | None = None
+
+    def preparar() -> bool:  # type: ignore[misc]
+        global _PREPARADO
+        if _PREPARADO is None:
+            _PREPARADO = _preparar_banco()
+        return _PREPARADO
+
+
 def _garantir_colunas() -> None:
     """Adiciona colunas que surgiram depois que o banco já existia.
 
@@ -615,19 +641,30 @@ def recalcular_status_carga(carga_id: int) -> str:
     entregue = sa.case((notas.c.status == "E", 1), else_=0)
     devolvida = sa.case((notas.c.status == "D", 1), else_=0)
 
+    # traz as contagens e o status atual da carga na MESMA consulta
     stmt = sa.select(
         sa.func.count(notas.c.id),
         sa.func.sum(resolvida),
         sa.func.sum(entregue),
         sa.func.sum(devolvida),
         sa.func.max(notas.c.data_checkout),
-    ).where(notas.c.carga_id == carga_id)
+        sa.func.max(cargas.c.status),
+        sa.func.max(cargas.c.data_entrega),
+    ).select_from(
+        cargas.outerjoin(notas, notas.c.carga_id == cargas.c.id)
+    ).where(cargas.c.id == carga_id)
 
     with get_engine().connect() as conn:
-        total, resolvidas, entregues, devolvidas, ultima = conn.execute(stmt).first()
+        linha = conn.execute(stmt).first()
+    if linha is None:
+        return "P"
+    (total, resolvidas, entregues, devolvidas, ultima,
+     status_atual, entrega_atual) = linha
 
     if not total:
-        return "P"
+        return status_atual or "P"
+    if status_atual == "C":
+        return "C"
 
     resolvidas = int(resolvidas or 0)
     entregues = int(entregues or 0)
@@ -647,9 +684,14 @@ def recalcular_status_carga(carga_id: int) -> str:
     if isinstance(ultima, pd.Timestamp):
         ultima = ultima.date()
 
-    salvar_carga({"status": novo,
-                  "data_entrega": ultima if novo in ("E", "D") else None},
-                 carga_id=carga_id)
+    nova_entrega = ultima if novo in ("E", "D") else None
+    if isinstance(entrega_atual, pd.Timestamp):
+        entrega_atual = entrega_atual.date()
+
+    # grava só quando algo realmente mudou — economiza uma viagem por clique
+    if novo != status_atual or nova_entrega != entrega_atual:
+        salvar_carga({"status": novo, "data_entrega": nova_entrega},
+                     carga_id=carga_id)
     return novo
 
 
