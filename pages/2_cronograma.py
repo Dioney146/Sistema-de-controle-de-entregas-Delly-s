@@ -18,10 +18,9 @@ ui.rodape_sidebar()
 
 info = MODALIDADES[modalidade]
 dias_no_mes = calendar.monthrange(ano, mes)[1]
-ui.cabecalho(
-    f"{info['icone']} Cronograma — {info['label']}",
-    f"01/{mes:02d}/{ano} a {dias_no_mes}/{mes:02d}/{ano} · {dias_no_mes} dias",
-)
+ui.cabecalho('<span class="marca">◤</span> CRONOGRAMA DE CORTES',
+             f"{info['icone']} {info['label']}",
+             f"01/{mes:02d}/{ano} — {dias_no_mes}/{mes:02d}/{ano}")
 
 df_ano = db.listar_cargas(modalidade, ano=ano)
 df_mes = df_ano[df_ano["mes"] == mes] if not df_ano.empty else df_ano
@@ -63,7 +62,7 @@ estilo = (matriz.style
           .map(_pintar, subset=colunas_dias)
           .set_properties(subset=colunas_dias, **{"text-align": "center"}))
 
-st.markdown("**Grade do mês** — cada célula traz o status da carga na sua data de corte")
+ui.secao("Grade do mês", "cada célula traz o status da carga na data de corte")
 st.dataframe(estilo, width="stretch", hide_index=True,
              height=min(80 + 35 * len(matriz), 600))
 
@@ -71,7 +70,7 @@ legenda = " · ".join(f"**{codigo}** {nome}" for codigo, nome in STATUS.items())
 st.caption(f"Legenda: {legenda} · **2x** mais de uma carga no mesmo dia")
 
 st.divider()
-st.markdown("**Totais do mês por município**")
+ui.secao("Totais por município")
 totais = metrics.totais_por_municipio_mes(df_mes, municipios)
 st.dataframe(totais, width="stretch", hide_index=True)
 
