@@ -29,7 +29,8 @@ from sqlalchemy import (
     String, Table, UniqueConstraint, func,
 )
 
-from src.config import MODALIDADE_PADRAO, PRAZO_PADRAO_DIAS, STATUS_NOTA_RESOLVIDO
+from src.config import (MODALIDADE_PADRAO, PRAZO_PADRAO_DIAS,
+                        STATUS_NOTA_RESOLVIDO, agora)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -122,6 +123,7 @@ notas = Table(
     Column("status", String(1), default="P"),
     Column("ocorrencia", String(60), default="Sem ocorrência"),
     Column("data_checkout", Date),
+    Column("checkout_em", DateTime),      # data e hora exatas do checkout
     Column("observacao", String(300)),
     UniqueConstraint("carga_id", "numcar", "numnota", name="uq_nota_carga"),
 )
@@ -166,6 +168,29 @@ except Exception:
 
 def init_db() -> None:
     metadata.create_all(get_engine())
+    _garantir_colunas()
+
+
+def _garantir_colunas() -> None:
+    """Adiciona colunas que surgiram depois que o banco já existia.
+
+    `create_all` só cria tabelas novas, não altera as existentes — então as
+    colunas acrescentadas em versões posteriores entram por aqui.
+    """
+    novas = {
+        "notas": {"checkout_em": "TIMESTAMP"},
+    }
+    inspetor = sa.inspect(get_engine())
+    for tabela, colunas in novas.items():
+        if tabela not in inspetor.get_table_names():
+            continue
+        existentes = {c["name"] for c in inspetor.get_columns(tabela)}
+        for coluna, tipo in colunas.items():
+            if coluna in existentes:
+                continue
+            with get_engine().begin() as conn:
+                conn.execute(sa.text(
+                    f"ALTER TABLE {tabela} ADD COLUMN {coluna} {tipo}"))
 
 
 def is_sqlite() -> bool:
@@ -292,11 +317,15 @@ def listar_notas(modalidade: str | None = None,
     df = _read(stmt.order_by(notas.c.cliente, notas.c.numnota))
     if df.empty:
         for col in ["id", "carga_id", "modalidade", "numcar", "numnota", "codcli",
-                    "cliente", "status", "ocorrencia", "data_checkout", "observacao"]:
+                    "cliente", "status", "ocorrencia", "data_checkout",
+                    "checkout_em", "observacao"]:
             if col not in df.columns:
                 df[col] = pd.NA
         return df
     df["data_checkout"] = pd.to_datetime(df["data_checkout"], errors="coerce")
+    if "checkout_em" not in df.columns:
+        df["checkout_em"] = pd.NaT
+    df["checkout_em"] = pd.to_datetime(df["checkout_em"], errors="coerce")
     df["pendente"] = df["status"] == "P"
     df["entregue"] = df["status"] == "E"
     df["com_ocorrencia"] = (
@@ -511,16 +540,29 @@ def salvar_nota(dados: dict, nota_id: int) -> None:
 
 
 def checkout_notas(ids: list[int], status: str, ocorrencia: str,
-                   data_checkout, observacao: str | None = None) -> int:
-    """Dá checkout em várias notas de uma vez (um cliente ou a carga inteira)."""
+                   data_checkout=None, observacao: str | None = None,
+                   momento=None) -> int:
+    """Dá checkout em várias notas de uma vez (um cliente ou a carga inteira).
+
+    A data e a hora são carimbadas automaticamente no momento do checkout;
+    voltar a nota para Pendente limpa esse carimbo.
+    """
     if not ids:
         return 0
+    momento = momento or agora()
+    if isinstance(momento, pd.Timestamp):
+        momento = momento.to_pydatetime()
+    if data_checkout is None:
+        data_checkout = momento.date()
     if isinstance(data_checkout, pd.Timestamp):
         data_checkout = data_checkout.date()
+
+    resolvido = status != "P"
     valores = {
         "status": status,
         "ocorrencia": ocorrencia or "Sem ocorrência",
-        "data_checkout": data_checkout if status != "P" else None,
+        "data_checkout": data_checkout if resolvido else None,
+        "checkout_em": momento if resolvido else None,
     }
     if observacao is not None:
         valores["observacao"] = observacao or None
