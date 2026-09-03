@@ -337,19 +337,34 @@ def listar_notas(modalidade: str | None = None,
 
 
 def resumo_checkout_por_carga(modalidade: str | None = None) -> pd.DataFrame:
-    """Contagem de notas por carga (total, entregues, pendentes, clientes)."""
-    df = listar_notas(modalidade)
+    """Contagem de notas por carga (total, entregues, pendentes, clientes).
+
+    A soma é feita pelo banco (GROUP BY), não trazendo as notas para o Python —
+    é o que mantém a tela leve quando a modalidade acumula milhares de notas.
+    """
+    entregue = sa.case((notas.c.status == "E", 1), else_=0)
+    pendente = sa.case((notas.c.status == "P", 1), else_=0)
+    ocorrencia = sa.case(
+        (sa.func.coalesce(notas.c.ocorrencia, "Sem ocorrência") != "Sem ocorrência", 1),
+        else_=0)
+
+    stmt = sa.select(
+        notas.c.carga_id.label("id"),
+        sa.func.count(notas.c.id).label("notas_total"),
+        sa.func.sum(entregue).label("notas_entregues"),
+        sa.func.sum(pendente).label("notas_pendentes"),
+        sa.func.sum(ocorrencia).label("notas_ocorrencia"),
+        sa.func.count(sa.distinct(notas.c.codcli)).label("clientes"),
+    ).group_by(notas.c.carga_id)
+
+    if modalidade:
+        stmt = stmt.where(notas.c.modalidade == modalidade)
+
+    df = _read(stmt)
     if df.empty:
         return pd.DataFrame(columns=["id", "notas_total", "notas_entregues",
                                      "notas_pendentes", "notas_ocorrencia", "clientes"])
-    agrupado = df.groupby("carga_id").agg(
-        notas_total=("id", "count"),
-        notas_entregues=("entregue", "sum"),
-        notas_pendentes=("pendente", "sum"),
-        notas_ocorrencia=("com_ocorrencia", "sum"),
-        clientes=("codcli", "nunique"),
-    ).reset_index().rename(columns={"carga_id": "id"})
-    return agrupado
+    return df
 
 
 def notas_por_cliente(carga_id: int) -> pd.DataFrame:
