@@ -24,8 +24,9 @@ ui.rodape_sidebar()
 
 info = MODALIDADES[modalidade]
 label_placa = info["doc_label"]
-ui.cabecalho(f"🗓️ Programar cortes — {info['label']}",
-             "registre o corte antes de o Wynthor liberar os dados")
+ui.cabecalho('<span class="marca">◤</span> PROGRAMAÇÃO DE CORTES',
+             f"{info['icone']} {info['label']}",
+             "registro do corte antes do faturamento")
 
 cadastro = db.listar_municipios(modalidade, somente_ativos=True)
 if cadastro.empty:
@@ -39,7 +40,7 @@ ufs_por_municipio = dict(zip(cadastro["nome"], cadastro["uf"]))
 # ---------------------------------------------------------------------------
 # Novo corte
 # ---------------------------------------------------------------------------
-st.subheader("Novo corte")
+ui.secao("Novo corte", "marque os municípios cortados na data")
 
 col1, col2 = st.columns([1, 2])
 data_corte = col1.date_input("Data de corte", value=date.today(),
@@ -89,7 +90,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 # Programações aguardando o arquivo
 # ---------------------------------------------------------------------------
-st.subheader("Cortes aguardando o arquivo do Wynthor")
+ui.secao("Aguardando arquivo do Wynthor", "cortes programados sem notas")
 
 abertas = db.listar_programacoes_abertas(modalidade)
 if abertas.empty:
