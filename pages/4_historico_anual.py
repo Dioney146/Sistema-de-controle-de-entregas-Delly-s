@@ -15,8 +15,9 @@ ano, _ = ui.seletor_periodo(modalidade, com_mes=False)
 ui.rodape_sidebar()
 
 info = MODALIDADES[modalidade]
-ui.cabecalho(f"{info['icone']} Histórico anual — {info['label']}",
-             f"matriz município × mês do ano {ano}")
+ui.cabecalho('<span class="marca">◤</span> HISTÓRICO ANUAL',
+             f"{info['icone']} {info['label']}",
+             f"matriz município × mês · {ano}")
 
 df_ano = db.listar_cargas(modalidade, ano=ano)
 cadastro = db.listar_municipios(modalidade, somente_ativos=True)
@@ -59,7 +60,7 @@ with col_b:
     st.plotly_chart(fig2, width="stretch")
 
 st.divider()
-st.markdown("**Resumo mensal da operação**")
+ui.secao("Resumo mensal da operação")
 resumo = metrics.resumo_mensal_operacao(df_ano)
 st.dataframe(resumo, width="stretch", hide_index=True)
 
