@@ -225,6 +225,30 @@ def is_sqlite() -> bool:
     return get_engine().dialect.name == "sqlite"
 
 
+def medir_latencia(repeticoes: int = 7) -> dict:
+    """Tempo de ida e volta até o banco, em milissegundos.
+
+    Serve para comparar regiões do Supabase: cada clique do checkout custa
+    cerca de 4 dessas viagens.
+    """
+    import time
+
+    tempos = []
+    with get_engine().connect() as conn:
+        conn.execute(sa.text("SELECT 1"))  # descarta a 1a (abre a conexão)
+        for _ in range(repeticoes):
+            inicio = time.perf_counter()
+            conn.execute(sa.text("SELECT 1"))
+            tempos.append((time.perf_counter() - inicio) * 1000)
+    tempos.sort()
+    return {
+        "media_ms": round(sum(tempos) / len(tempos), 1),
+        "mediana_ms": round(tempos[len(tempos) // 2], 1),
+        "pior_ms": round(tempos[-1], 1),
+        "por_clique_ms": round(sum(tempos) / len(tempos) * 4, 0),
+    }
+
+
 def esquema_desatualizado() -> bool:
     """True se a tabela `cargas` ainda for a versão antiga (com `numcar`)."""
     try:
