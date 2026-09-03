@@ -18,8 +18,9 @@ ui.rodape_sidebar()
 info = MODALIDADES[modalidade]
 label_placa = info["doc_label"]
 
-ui.cabecalho(f"📥 Importar do Wynthor — {info['label']}",
-             "as notas entram individualmente para o checkout por cliente")
+ui.cabecalho('<span class="marca">◤</span> IMPORTAÇÃO WYNTHOR',
+             f"{info['icone']} {info['label']}",
+             "entrada de notas fiscais no sistema")
 
 st.markdown(
     "**Colunas usadas:** `CODCLI`, `CLIENTE`, `NUMNOTA` e `NUMCAR`. "
@@ -54,7 +55,7 @@ st.divider()
 # ---------------------------------------------------------------------------
 # 1. Data de corte (manual)
 # ---------------------------------------------------------------------------
-st.subheader("1. Data de corte")
+ui.secao("1 · Data de corte")
 
 abertas = db.listar_programacoes_abertas(modalidade)
 data_sugerida = date.today()
@@ -87,7 +88,7 @@ dias_prazo = col_prazo.number_input("Prazo de entrega (dias após o corte)",
 # ---------------------------------------------------------------------------
 # 2. Conferência das cargas
 # ---------------------------------------------------------------------------
-st.subheader("2. Confira as cargas")
+ui.secao("2 · Confira as cargas")
 grupos = importer.resumir_grupos(notas)
 st.caption("Corrija o município ou a placa se vieram errados do arquivo. "
            "Cada linha vira uma carga.")
@@ -128,7 +129,7 @@ with st.expander(f"Ver as {len(notas)} notas que serão importadas"):
 # ---------------------------------------------------------------------------
 # 4. Importar
 # ---------------------------------------------------------------------------
-st.subheader("3. Importar")
+ui.secao("3 · Importar")
 criar_cadastros = st.checkbox(
     "Cadastrar automaticamente municípios e placas que ainda não existem", value=True,
     help="Deixe ligado para não precisar inserir cada município por SQL.")
