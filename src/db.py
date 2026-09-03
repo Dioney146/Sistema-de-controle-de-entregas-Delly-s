@@ -147,7 +147,9 @@ def _build_engine() -> sa.Engine:
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
     if url.startswith("sqlite"):
         return sa.create_engine(url, connect_args={"check_same_thread": False})
-    return sa.create_engine(url, pool_pre_ping=True)
+    # sem pool_pre_ping: ele dispara um "SELECT 1" antes de cada consulta, o que
+    # dobra as viagens de rede até o Supabase. pool_recycle evita conexão morta.
+    return sa.create_engine(url, pool_recycle=1800, pool_size=5, max_overflow=5)
 
 
 try:
@@ -365,6 +367,22 @@ def resumo_checkout_por_carga(modalidade: str | None = None) -> pd.DataFrame:
         return pd.DataFrame(columns=["id", "notas_total", "notas_entregues",
                                      "notas_pendentes", "notas_ocorrencia", "clientes"])
     return df
+
+
+def contar_notas_da_carga(carga_id: int) -> dict:
+    """Totais de uma única carga, direto no banco."""
+    entregue = sa.case((notas.c.status == "E", 1), else_=0)
+    pendente = sa.case((notas.c.status == "P", 1), else_=0)
+    stmt = sa.select(
+        sa.func.count(notas.c.id),
+        sa.func.sum(entregue),
+        sa.func.sum(pendente),
+        sa.func.count(sa.distinct(notas.c.codcli)),
+    ).where(notas.c.carga_id == carga_id)
+    with get_engine().connect() as conn:
+        total, entregues, pendentes, clientes = conn.execute(stmt).first()
+    return {"total": int(total or 0), "entregues": int(entregues or 0),
+            "pendentes": int(pendentes or 0), "clientes": int(clientes or 0)}
 
 
 def notas_por_cliente(carga_id: int) -> pd.DataFrame:
@@ -587,40 +605,51 @@ def checkout_notas(ids: list[int], status: str, ocorrencia: str,
 
 
 def recalcular_status_carga(carga_id: int) -> str:
-    """Status da carga a partir das notas: P / T (parcial) / E / D."""
-    df = listar_notas(carga_id=carga_id)
-    if df.empty:
-        return "P"
-    atual = buscar_carga_por_id(carga_id)
-    if atual and atual.get("status") == "C":
-        return "C"
+    """Status da carga a partir das notas: P / T (parcial) / E / D.
 
-    total = len(df)
-    resolvidas = int(df["status"].isin(STATUS_NOTA_RESOLVIDO).sum())
-    entregues = int((df["status"] == "E").sum())
-    devolvidas = int((df["status"] == "D").sum())
+    A contagem é feita pelo banco (uma consulta) e o resultado gravado em um
+    único UPDATE — são só duas viagens de rede, o que importa porque isto roda
+    a cada checkout.
+    """
+    resolvida = sa.case((notas.c.status.in_(STATUS_NOTA_RESOLVIDO), 1), else_=0)
+    entregue = sa.case((notas.c.status == "E", 1), else_=0)
+    devolvida = sa.case((notas.c.status == "D", 1), else_=0)
+
+    stmt = sa.select(
+        sa.func.count(notas.c.id),
+        sa.func.sum(resolvida),
+        sa.func.sum(entregue),
+        sa.func.sum(devolvida),
+        sa.func.max(notas.c.data_checkout),
+    ).where(notas.c.carga_id == carga_id)
+
+    with get_engine().connect() as conn:
+        total, resolvidas, entregues, devolvidas, ultima = conn.execute(stmt).first()
+
+    if not total:
+        return "P"
+
+    resolvidas = int(resolvidas or 0)
+    entregues = int(entregues or 0)
+    devolvidas = int(devolvidas or 0)
 
     if resolvidas == 0:
         novo = "P"
-    elif resolvidas < total:
+    elif resolvidas < int(total):
         novo = "T"
     elif entregues == 0 and devolvidas > 0:
         novo = "D"
     else:
         novo = "E"
 
-    valores: dict = {"status": novo}
-    if novo in ("E", "D"):
-        datas = df["data_checkout"].dropna()
-        if not datas.empty:
-            valores["data_entrega"] = datas.max().date()
-    else:
-        valores["data_entrega"] = None
+    if isinstance(ultima, str):
+        ultima = pd.to_datetime(ultima, errors="coerce")
+    if isinstance(ultima, pd.Timestamp):
+        ultima = ultima.date()
 
-    ocorrencias = df.loc[df["com_ocorrencia"], "ocorrencia"]
-    valores["ocorrencia"] = (ocorrencias.mode().iloc[0]
-                             if not ocorrencias.empty else "Sem ocorrência")
-    salvar_carga(valores, carga_id=carga_id)
+    salvar_carga({"status": novo,
+                  "data_entrega": ultima if novo in ("E", "D") else None},
+                 carga_id=carga_id)
     return novo
 
 
