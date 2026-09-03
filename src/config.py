@@ -117,3 +117,18 @@ DIAS_SEMANA_CURTOS = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
 UFS = ["AM", "BA", "DF", "ES", "MG", "SP", "PA", "RO", "RR", "AC", "AP"]
 
 PRAZO_PADRAO_DIAS = 4
+
+# Fuso usado para carimbar a data/hora do checkout
+FUSO_HORARIO = "America/Manaus"
+
+
+def agora():
+    """Data e hora atuais no fuso da operação (sem depender do servidor)."""
+    from datetime import datetime
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(FUSO_HORARIO)).replace(tzinfo=None)
+    except Exception:  # fuso indisponível no ambiente
+        return datetime.now()
