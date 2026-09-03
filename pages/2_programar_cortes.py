@@ -29,8 +29,8 @@ ui.cabecalho(f"🗓️ Programar cortes — {info['label']}",
 
 cadastro = db.listar_municipios(modalidade, somente_ativos=True)
 if cadastro.empty:
-    st.warning("Cadastre municípios desta modalidade em **Cadastros** para "
-               "programar os cortes.")
+    st.warning("Nenhum município cadastrado nesta modalidade. O cadastro é "
+               "feito por SQL no painel do Supabase (tabela `municipios`).")
     st.stop()
 
 prazos = dict(zip(cadastro["nome"], cadastro["prazo_dias"]))
